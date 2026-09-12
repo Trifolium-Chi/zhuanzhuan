@@ -124,13 +124,33 @@ def check_source():
 
 # ---------------------------------------------------------------- 2. 桥接 plist
 def check_plist():
-    print("\n=== 2. 桥接 plist ===")
-    p = os.path.join(ROOT, "layout", "Library", "MobileSubstrate",
-                     "DynamicLibraries", "ZZMergeBridge.plist")
-    if not os.path.exists(p):
-        say(FAIL, "找不到 ZZMergeBridge.plist")
+    print("\n=== 2. 桥接 plist（滤器配置）===")
+    # 关键：Theos 的 instance/tweak.mk 在【项目根目录】查找
+    #   $(THEOS_CURRENT_INSTANCE).plist（即 ZZMergeBridge.plist）或 Filter.plist，
+    # 找到后自己 cp 到 $(THEOS_STAGING_DIR)$(LOCAL_INSTALL_PATH)/。
+    # 若放在 layout/ 下，Theos 找不到它，会报
+    #   "You are missing a filter property list"（这是第 7 次失败的根因）。
+    root_p = os.path.join(ROOT, "ZZMergeBridge.plist")
+    filter_p = os.path.join(ROOT, "Filter.plist")
+    found = None
+    if os.path.exists(root_p):
+        found = root_p
+        say(OK, "plist 位于项目根目录（Theos 查找的位置）: ZZMergeBridge.plist")
+    elif os.path.exists(filter_p):
+        found = filter_p
+        say(OK, "plist 位于项目根目录: Filter.plist")
+    else:
+        say(FAIL, "项目根目录缺少 ZZMergeBridge.plist 或 Filter.plist"
+                  "（Theos 会自动报 missing filter property list）")
         return
-    s = read(p)
+
+    # 不该再放在 layout/Library/MobileSubstrate/DynamicLibraries 下（会重复）
+    old = os.path.join(ROOT, "layout", "Library", "MobileSubstrate",
+                       "DynamicLibraries")
+    if os.path.isdir(old):
+        say(WARN, "layout/ 下仍有 DynamicLibraries 目录，可能重复打包: %s" % old)
+
+    s = read(found)
     ok = ("com.wuba.zhuanzhuan" in s) and ("<key>Filter</key>" in s) and ("Bundles" in s)
     say(OK if ok else FAIL, "注入目标为 com.wuba.zhuanzhuan 且结构正确: %s" % ok)
     say(OK if s.strip().startswith("<?xml") else WARN, "是标准 plist XML")
@@ -222,6 +242,17 @@ def check_makefile():
     say(OK if "before-package" not in s else WARN,
         "未使用非标准钩子 before-package: %s" % ("before-package" not in s))
 
+    # 架构：应为 arm64 单架构（Linux 上无法产出可靠的 arm64e 新 ABI）
+    m_arch = re.search(r"(?m)^\s*export\s+ARCHS\s*=\s*(.+)$", s)
+    if m_arch:
+        archs = m_arch.group(1).strip()
+        say(OK, "ARCHS = %s" % archs)
+        if "arm64e" in archs:
+            say(WARN, "仍包含 arm64e —— Linux 工具链只能出旧 ABI，"
+                      "链接器会警告 incompatible arm64e ABI，真机加载有风险")
+    else:
+        say(WARN, "未显式设置 ARCHS（将由 Theos 取默认值）")
+
     # 关键：不能默认导出 THEOS_PACKAGE_SCHEME，否则 Theos 会因未知 scheme 直接报错
     bad_scheme = re.findall(r"(?m)^\s*export\s+THEOS_PACKAGE_SCHEME\s*[:?]?=", s)
     say(OK if not bad_scheme else FAIL,
@@ -249,6 +280,14 @@ def check_workflow():
     say(OK if "dpkg-deb -x" in s else FAIL, "从 vendor_src 解出原始 dylib")
     say(OK if "make package FINALPACKAGE=1" in s else FAIL, "执行 make package")
     say(OK if "upload-artifact" in s else FAIL, "上传 deb 产物")
+    # 关键：Theos 产物在 packages/ 下，上传路径不能写成仅根目录的 "*.deb"
+    say(OK if "dist/*.deb" in s else FAIL,
+        "上传路径指向 dist/*.deb（deb 不在仓库根目录，这是第 8 次失败的原因）")
+    m_badpath = re.search(r'(?m)^\s*path:\s*"?\*\.deb"?\s*$', s)
+    say(OK if not m_badpath else FAIL,
+        "没有使用只在根目录匹配的 path: *.deb: %s" % (not m_badpath))
+    say(OK if "mkdir -p dist" in s else FAIL,
+        "构建步骤把 deb 收集到 dist/（不依赖 Theos 默认输出目录）")
 
     # ---- iOS SDK 安装必须有多重回退 + 硬校验（第二次构建失败的根因）----
     say(OK if "get-toolchain.sh" in s else FAIL, "方式A：调用官方 get-toolchain.sh")
@@ -259,20 +298,70 @@ def check_workflow():
     say(OK if 'grep -qi' in s and 'iPhoneOS' in s else FAIL,
         "校验 sdks 目录里确实存在 iPhoneOS*.sdk")
 
+    # 注意：以下正则必须在"剥离注释后"的正文上跑，
+    # 否则会把注释里记录历史错误的那句原话当成真实代码（曾误报过）。
+    code = re.sub(r"(?m)^\s*#.*$", "", s)
+
     # ---- 编译工具链必须也有回退 + 硬校验（第三次构建失败的根因）----
     say(OK if "toolchain/linux/iphone" in s else FAIL,
         "工具链目标目录 toolchain/linux/iphone")
     say(OK if "toolchain_ok" in s else FAIL, "定义工具链校验函数 toolchain_ok")
-    say(OK if "-x \"$TOOLCHAIN_DIR/bin/clang\"" in s else FAIL,
-        "以 clang 是否可执行作为工具链判定标准")
-    say(OK if "download.swift.org" in s else FAIL,
-        "方式B：下载 Swift 官方工具链（含交叉编译 clang）")
-    say(OK if "CANDIDATES" in s and "for v in $CANDIDATES" in s else FAIL,
-        "候选 Swift 版本轮询（不写死单一版本号）")
-    say(OK if "command -v clang" in s else FAIL,
-        "方式C：系统 clang 兜底（网络受限时仍有机会成功）")
-    say(OK if "apt-get install" in s and "clang lld llvm binutils" in s else FAIL,
-        "apt 安装 clang/lld/llvm/binutils（兜底路径依赖）")
+    # 关键：判定必须同时要求 clang 与 ld，且 ld 不能是 GNU ld
+    say(OK if "ld_is_apple" in s else FAIL, "定义链接器判定函数 ld_is_apple")
+    say(OK if "gnu ld" in s.lower() else FAIL,
+        "显式排除 GNU ld（这是第四次构建失败的根因）")
+    say(OK if "ld64.lld" in s else FAIL, "使用 ld64.lld 作为 Apple 链接器")
+    say(OK if "llvm-project/releases/download" in s else FAIL,
+        "方式D：从 LLVM 官方发布版获取 clang + ld64.lld")
+    say(OK if "clang+llvm-" in s else FAIL,
+        "LLVM 文件名使用正确形式 clang+llvm-<ver>-x86_64-linux-gnu-<os>")
+    m_badname = re.search(r"LLVM-llvmorg-", s)
+    say(OK if not m_badname else FAIL,
+        "没有使用错误的 LLVM 文件名（把 llvmorg- 前缀拼进文件名）: %s"
+        % (not m_badname))
+    say(OK if "18.1.8" in s and "17.0.6" in s and "16.0.6" in s else FAIL,
+        "轮询多个实测可用的 LLVM 版本")
+    say(OK if "kabiroberai/swift-toolchain-linux" in s else FAIL,
+        "方式A 使用 Theos 自己用的 Swift 工具链地址（kabiroberai）")
+    say(OK if "L1ghtmann/llvm-project" in s else FAIL,
+        "方式B 使用 Theos 自己用的 iOSToolchain 地址（L1ghtmann）")
+    say(OK if "api.github.com/repos/theos/sdks/releases/latest" in s else FAIL,
+        "SDK 走 Theos 官方 releases API（实测自 install-sdk）")
+    # 必须调用真实存在的 Theos 脚本
+    say(OK if "install-theos" in s else FAIL,
+        "方式A 调用真实存在的 theos/bin/install-theos")
+    m_ghost = re.search(r'"?\$THEOS/bin/get-toolchain\.sh"?', code)
+    say(OK if not m_ghost else FAIL,
+        "没有调用不存在的 get-toolchain.sh（第 5 次失败的根因）: %s" % (not m_ghost))
+    say(OK if "try_get" in s else FAIL,
+        "有 URL 探测函数 try_get（打印 HTTP 状态码）")
+    say(OK if "http_code" in s else FAIL, "探测时输出 HTTP 状态码")
+    # 注意：下面这些正则必须在"剥离注释后"的正文上跑，
+    # 否则会把注释里记录历史错误的那句原话当成真实代码（曾误报过）。
+    code = re.sub(r"(?m)^\s*#.*$", "", s)
+
+    m_bad = re.search(
+        r"ld64\.lld\s*\|\|\s*command\s+-v\s+ld\.lld\s*\|\|\s*command\s+-v\s+(lld|ld)\b", code)
+    say(OK if not m_bad else FAIL,
+        "没有把裸 ld/lld 当作链接器兜底（会导致 unknown argument 全线报错）: %s"
+        % (not m_bad))
+    say(OK if "CANDIDATES" not in code or "for v in" in code else WARN, "候选版本轮询")
+    say(OK if "show_state" in code or "show_ld" in code else FAIL,
+        "打印 clang/ld 身份（便于日志诊断）")
+    say(OK if "前置" in code else FAIL,
+        "构建前先诊断并清理错误的旧链接器")
+
+    # ---- 新增的关键保险：最小 dylib 链接自检 ----
+    say(OK if "链接自检" in s else FAIL,
+        "存在「最小 dylib 链接自检」步骤（提前暴露链接器问题）")
+    say(OK if "-dynamiclib -isysroot" in code else FAIL,
+        "自检真的执行了链接（-dynamiclib），而非只编译")
+    say(OK if '-target $arch-apple-ios15.0' in code else FAIL,
+        "自检带上 -target（与 Theos 的 VERSIONFLAGS 一致，这是第 6 次失败的根因）")
+    say(OK if "USE_CLANG_TARGET_FLAG" in s else FAIL,
+        "注释里说明了 -target 的依据（Linux/iphone.mk 的 USE_CLANG_TARGET_FLAG）")
+    say(OK if "链接自检失败" in code and "exit 1" in code else FAIL,
+        "自检失败时显式退出")
 
     # ---- 关键：不能再用 "|| true" 把安装失败吞掉 ----
     m = re.search(r"(?m)^.*get-toolchain\.sh.*\|\|\s*true\s*$", s)
@@ -296,6 +385,25 @@ def check_workflow():
     i_sdk = s.find("安装 iOS SDK")
     say(OK if 0 < i_tc < i_sdk else FAIL,
         "步骤顺序为先装工具链、再装 SDK（位置 %d < %d）" % (i_tc, i_sdk))
+    # ---- 闪退排查相关的关键设计 ----
+    say(OK if "with_bridge" in s else FAIL,
+        "有 with_bridge 开关（可构建「不含桥接层」的对照包排查闪退）")
+    say(OK if "github.event.inputs.with_bridge" in s else FAIL,
+        "Theos 相关步骤受 with_bridge 条件控制")
+    m2 = re.search(r"(?m)^\s*if:\s*\$\{\{\s*github\.event\.inputs\.with_bridge", s)
+    say(OK if m2 else FAIL, "存在 with_bridge 条件表达式")
+
+    # 水水不应再随包分发（桥接层已自行实现其功能，多装一个 dylib 只会多一个崩溃变量）
+    mk = io.open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    mk_code = re.sub(r"(?m)^\s*#.*$", "", mk)
+    m3 = re.search(r"vendor/\*\.dylib", mk_code)
+    say(OK if not m3 else FAIL,
+        "Makefile 不再用通配符并入全部 dylib（否则水水也会被打包）: %s" % (not m3))
+    say(OK if "ShuiShuiZZFilter.dylib" not in mk_code else FAIL,
+        "Makefile 不再要求 ShuiShuiZZFilter.dylib")
+    say(OK if "转转找鸡.dylib" in mk_code else FAIL,
+        "Makefile 明确并入 转转找鸡.dylib")
+
     say(OK, "工作流行数: %d" % len(s.splitlines()))
 
 
@@ -308,13 +416,31 @@ def check_control():
         return
     s = read(p)
     fields = dict(re.findall(r"(?m)^([A-Za-z-]+):\s*(.*)$", s))
-    for f in ("Package", "Name", "Version", "Architecture", "Depends", "Conflicts", "Section"):
+    for f in ("Package", "Name", "Version", "Architecture", "Depends", "Section"):
         say(OK if f in fields else FAIL, "字段 %s: %s" % (f, fields.get(f, "(缺失)")))
-    say(OK if fields.get("Architecture") == "iphoneos-arm64e" else WARN,
-        "架构为 iphoneos-arm64e（与原包一致）")
-    conf = fields.get("Conflicts", "")
-    for c in ("com.shuishui.zzfilter.roothide", "com.codev.zzphonefilter.roothide"):
-        say(OK if c in conf else WARN, "Conflicts 含 %s: %s" % (c, c in conf))
+    say(OK if fields.get("Architecture") == "iphoneos-arm64" else FAIL,
+        "架构为 iphoneos-arm64（桥接层是 arm64 构建）")
+
+    # 形态判定：本包是「附加插件」，不是「替换包」
+    pkg = fields.get("Package", "")
+    is_addon = pkg.endswith(".addon")
+    say(OK, "包形态: %s（Package=%s）" % ("附加插件" if is_addon else "整包替换", pkg))
+    if is_addon:
+        # 附加插件不该声明与找鸡冲突，也不该 Replaces/Provides 水水
+        say(OK if "Conflicts" not in fields else WARN,
+            "附加插件未声明 Conflicts（不应与找鸡本体冲突）: %s"
+            % ("Conflicts" not in fields))
+        say(OK if "Replaces" not in fields else WARN,
+            "附加插件未声明 Replaces: %s" % ("Replaces" not in fields))
+        say(OK if "Provides" not in fields else WARN,
+            "附加插件未声明 Provides: %s" % ("Provides" not in fields))
+        d = fields.get("Depends", "")
+        say(OK if "mobilesubstrate" in d else WARN, "Depends 含 mobilesubstrate")
+    else:
+        conf = fields.get("Conflicts", "")
+        for c in ("com.shuishui.zzfilter.roothide", "com.codev.zzphonefilter.roothide"):
+            say(OK if c in conf else WARN, "Conflicts 含 %s: %s" % (c, c in conf))
+
     say(OK if "rootless-compat" in fields.get("Pre-Depends", "") else WARN,
         "保留 rootless-compat 前置依赖（与原找鸡包一致）")
 
