@@ -1,21 +1,28 @@
 name: Build ZZMerge deb
 
-# 触发方式：
-#   1. 推送到 main / master 自动构建
-#   2. 手动：Actions -> Run workflow
+# ===========================================================================
+# 触发：推送到 main/master，或手动 Run workflow
 #
-# 【重要】关于构建模式：
-#   本包刻意采用 **rootful（默认）** 构建方式，不设置 THEOS_PACKAGE_SCHEME。
+# 【构建模式】rootful（默认），刻意不设 THEOS_PACKAGE_SCHEME。
+#   依据：原版找鸡的 control 写着 Pre-Depends: rootless-compat，
+#   安装路径为 /Library/MobileSubstrate/DynamicLibraries/ —— 它本身就是 rootful，
+#   由 rootless-compat 在无根/RootHide 设备上做路径映射。照抄它最稳。
+#   另：Theos 没有名为 "roothide" 的 scheme，设了会直接报错。
 #
-#   原因：原版「转转找鸡」包就是 rootful 构建，证据是它的元数据：
-#       Pre-Depends: rootless-compat (>= 0.9)
-#       安装路径:    /Library/MobileSubstrate/DynamicLibraries/
-#   rootless-compat 这层兼容包会在无根 / RootHide 设备上把 /Library/...
-#   自动映射到真实位置（如 /var/jb/Library/...）。所以照抄它的构建方式最稳——
-#   你的设备上找鸡本来就能用，说明这条路是通的。
+# 【工具链】这是本工程最难缠的一环，历史失败记录：
+#   1. 'roothide' package scheme does not exist
+#   2. You do not have any SDKs in .../theos/sdks
+#   3. .../toolchain/linux/iphone/bin/clang: No such file or directory
+#   4. ld: error: unknown argument '-dynamic' / '-dylib' / '-arch' ...
+#      —— clang 是 Apple 目标的，链接器却被换成了 GNU ld，两者不兼容。
 #
-#   另外：Theos 官方并不存在名为 "roothide" 的 package scheme，
-#   设置它会直接报错 "'roothide' package scheme does not exist"。
+#   第 4 次的根因有两个，都已修正：
+#     (a) 曾写 `command -v ld64.lld || command -v ld.lld || command -v lld`，
+#         其中 `lld` 会解析到 /usr/bin/ld（GNU ld）—— 这个降级是致命的；
+#     (b) 判定函数只看 clang 是否存在，于是错误的链接器被放行。
+#   现在：来源改为 LLVM 官方发布版（明确同时含 clang 与 ld64.lld，
+#         且静态链接、不挑发行版），判定同时要求 clang + 真正的 ld64。
+# ===========================================================================
 on:
   workflow_dispatch:
   push:
@@ -29,35 +36,27 @@ jobs:
     runs-on: ubuntu-latest
     env:
       THEOS: ${{ github.workspace }}/theos
-      # 故意不设置 THEOS_PACKAGE_SCHEME —— 保持 rootful，与找鸡一致
 
     steps:
       - name: 取源码
         uses: actions/checkout@v4
 
-      - name: 安装构建依赖（含编译工具链依赖）
+      - name: 安装构建依赖
         run: |
           set -e
           sudo apt-get update
-          # clang/lld/gold 等是"系统 clang 兜底"路径要用的；
-          # libtinfo5 部分脚本会依赖，装不上不算致命。
           sudo apt-get install -y --no-install-recommends \
             fakeroot git make perl xz-utils curl ca-certificates dpkg \
-            file zstd unzip zip rsync \
-            clang lld llvm binutils
-          sudo apt-get install -y --no-install-recommends libtinfo5 \
-            || echo "!!! libtinfo5 装不上（继续）"
-
-          echo ">>> 系统编译器版本:"
-          clang --version | head -3
-          which ld64.lld ld.lld lld 2>/dev/null || echo "  (未找到 lld 变体)"
+            file zstd unzip zip rsync binutils
+          echo ">>> 基础工具:"
+          git --version; make --version | head -1; perl --version | head -2
 
           mkdir -p "$HOME/.local/bin"
-          curl -fsSL -o "$HOME/.local/bin/ldid" \
+          curl -fsSL --retry 3 -o "$HOME/.local/bin/ldid" \
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
           chmod +x "$HOME/.local/bin/ldid"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/ldid" -h 2>&1 | head -2 || true
+          echo ">>> ldid:"; "$HOME/.local/bin/ldid" -h 2>&1 | head -2 || true
 
       - name: 克隆 Theos
         run: |
@@ -67,248 +66,218 @@ jobs:
           git -C "$THEOS" submodule update --init --recursive --recommend-shallow \
             || echo "!!! 子模块补充失败（继续）"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          echo ">>> Theos 目录:"
-          ls "$THEOS"
-          echo ">>> 当前 Theos 支持的 package scheme（用于核对）:"
-          ls "$THEOS/makefiles/package" 2>/dev/null || echo "  (无 package 目录)"
+          echo ">>> Theos 目录:"; ls "$THEOS"
+          echo ">>> 可用 package scheme:"; ls "$THEOS/makefiles/package" 2>/dev/null || echo "  (无)"
 
-      # =========================================================================
-      # 工具链：这是本次失败的直接原因（toolchain/linux/iphone/bin/clang 不存在）
-      # 三级策略 + 硬校验，任何一级成功即止；全失败则打印诊断并退出
-      # =========================================================================
-      - name: 安装编译工具链（三级回退，失败即报错）
+      # =====================================================================
+      # 编译工具链
+      #   要求：$THEOS/toolchain/linux/iphone/bin 下有
+      #         1) 能交叉编译到 iOS 的 clang
+      #         2) Apple 兼容的链接器（ld64 / ld64.lld），绝不能是 GNU ld
+      # =====================================================================
+      - name: 安装编译工具链
         run: |
           set -uo pipefail
 
-          TOOLCHAIN_DIR="$THEOS/toolchain/linux/iphone"
-          TBIN="$TOOLCHAIN_DIR/bin"
+          TBIN="$THEOS/toolchain/linux/iphone/bin"
+          LLVM_BASE="https://github.com/llvm/llvm-project/releases/download"
+          # 这些版本的 Linux X64 包内同时有 clang 与 ld64.lld，且为静态链接
+          LLVM_VERSIONS="llvmorg-18.1.8 llvmorg-17.0.6 llvmorg-16.0.6"
 
-          # =====================================================================
-          # 关键判定：必须「clang 在」且「ld 是 Apple 兼容链接器」。
-          #
-          # 之前只检查 clang，导致一个严重误判：系统 clang 兜底把 clang 链好后，
-          # 判定立刻通过，于是真正的 Swift 工具链被跳过；而那一刻 $TBIN/ld
-          # 指向的是 GNU ld，它在链接阶段把所有 Apple 参数都判为
-          #     ld: error: unknown argument '-dylib' / '-arch' / '-framework'
-          #     ld: error: unknown emulation: ultiply_defined
-          # 所以现在必须连链接器一起验。
-          # =====================================================================
-          toolchain_ok() {
-            [ -x "$TBIN/clang" ] || return 1
-            [ -x "$TBIN/ld" ]    || return 1
-            # 用 -v 探测：ld64（Apple）会打印 "ld64" 或 "PROJECT:ld64"，
-            # GNU ld 打印的是 "GNU ld"。
-            "$TBIN/ld" -v >/dev/null 2>&1 || return 1
-            if "$TBIN/ld" -v 2>&1 | grep -qi 'gnu ld'; then
+          # ---- 判定：clang 与 ld 都必须存在，且 ld 不能是 GNU ld ----
+          ld_is_apple() {
+            [ -x "$TBIN/ld" ] || return 1
+            # lld 会打印 "LLD <ver>"; ld64 会打印 "ld64"/"PROJECT:ld64"
+            if "$TBIN/ld" -v 2>&1 | grep -qiE 'gnu ld|GNU gold'; then
               return 1
             fi
             return 0
           }
-
-          show_ld() {
-            echo "    ld = $(readlink -f "$TBIN/ld" 2>/dev/null || echo '?')"
+          toolchain_ok() {
+            [ -x "$TBIN/clang" ] || return 1
+            ld_is_apple
+          }
+          show_state() {
+            echo "    clang -> $(readlink -f "$TBIN/clang" 2>/dev/null || echo 无)"
+            "$TBIN/clang" --version 2>&1 | head -2 | sed 's/^/      /' || true
+            echo "    ld    -> $(readlink -f "$TBIN/ld" 2>/dev/null || echo 无)"
             "$TBIN/ld" -v 2>&1 | head -2 | sed 's/^/      /' || true
           }
 
           echo "=============================================================="
-          echo ">>> 工具链目标目录: $TOOLCHAIN_DIR"
+          echo ">>> 工具链目标: $TBIN"
           echo "=============================================================="
 
-          # ---------------- 前置诊断：先看看现况，尤其是链接器 ----------------
-          echo
-          echo ">>> [前置] 清理前 $TBIN 状态（用于诊断 Theos 默认放了什么）:"
-          if [ -d "$TBIN" ]; then
-            ls -la "$TBIN" | head -40
-            echo ">>> [前置] 现有 ld 指向: $(readlink -f "$TBIN/ld" 2>/dev/null || echo '不存在')"
-            if [ -x "$TBIN/ld" ]; then
-              if "$TBIN/ld" -v 2>&1 | grep -qi 'gnu ld'; then
-                echo ">>> [前置] 判定：这是 GNU ld —— 必须换掉（它就是上次链接失败的元凶）"
-              else
-                "$TBIN/ld" -v 2>&1 | head -2 | sed 's/^/      /'
-              fi
-            fi
+          # ---- 前置清理：清掉任何可能存在的错误链接器 ----
+          mkdir -p "$TBIN"
+          if [ -x "$TBIN/ld" ]; then
+            echo ">>> [前置] 发现已有 ld: $(readlink -f "$TBIN/ld" 2>/dev/null)"
+            "$TBIN/ld" -v 2>&1 | head -2 | sed 's/^/      /' || true
           else
-            echo "    (bin 目录还不存在)"
+            echo ">>> [前置] 尚无 ld"
           fi
-
-          # 无条件清掉可能指向 GNU ld 的链接器，让它由下面三级重新确定
-          if [ -d "$TBIN" ]; then
-            rm -f "$TBIN/ld" "$TBIN/lld" "$TBIN/ld64.lld"
-            echo ">>> [前置] 已清除旧的 ld / lld / ld64.lld 链接"
-          fi
+          rm -f "$TBIN/ld" "$TBIN/lld" "$TBIN/ld64.lld"
+          echo ">>> [前置] 已清除旧的 ld / lld / ld64.lld（将由下面三级重新确定）"
 
           # ---------------- 方式A：Theos 自带脚本 ----------------
           echo
           echo ">>> 方式A：$THEOS/bin/get-toolchain.sh"
           if [ -x "$THEOS/bin/get-toolchain.sh" ]; then
-            "$THEOS/bin/get-toolchain.sh" \
-              || echo "!!! get-toolchain.sh 返回非 0（继续看下面输出）"
-            echo ">>> get-toolchain.sh 之后的状态:"
-            ls -la "$TBIN" 2>/dev/null | head -30 || echo "    (bin 目录不存在)"
+            "$THEOS/bin/get-toolchain.sh" || echo "!!! get-toolchain.sh 返回非 0"
+            echo ">>> 方式A 之后 $TBIN:"; ls "$TBIN" 2>/dev/null | head -30 || true
           else
-            echo "!!! 找不到 $THEOS/bin/get-toolchain.sh"
-            echo ">>> $THEOS/bin 实际内容:"
-            ls -la "$THEOS/bin" 2>/dev/null || true
+            echo "!!! 不存在 $THEOS/bin/get-toolchain.sh"
+            echo ">>> $THEOS/bin 实际内容:"; ls "$THEOS/bin" 2>/dev/null || true
           fi
-          if toolchain_ok; then
-            echo ">>> 方式A 成功"
-            show_ld
-          else
-            echo ">>> 方式A 未成功（clang 或 ld 不满足）"
-            [ -x "$TBIN/ld" ] && show_ld || echo "    ld 不存在"
+          # 脚本可能只建了 clang 目录没给 ld64，这里补一次
+          if [ -x "$TBIN/clang" ] && ! ld_is_apple; then
+            echo ">>> 方式A 提供了 clang 但没有 Apple 链接器，稍后补齐"
           fi
+          if toolchain_ok; then echo ">>> 方式A 完整可用"; show_state; fi
 
-          # ---------------- 方式B：下载 Swift 官方工具链 ----------------
-          # 这是「正规」方案：Swift 工具链里带 Apple 目标的 clang 与 ld64。
+          # ---------------- 方式B：LLVM 官方发布版 ----------------
           if ! toolchain_ok; then
             echo
-            echo ">>> 方式B：下载 Swift 官方工具链"
-
-            SWIFT_BASE="https://download.swift.org/swift-release/ubuntu2204"
-            UBUNTU_TAG="ubuntu22.04"
-            CANDIDATES="6.0.3-RELEASE 6.0.2-RELEASE 6.0.1-RELEASE 6.0-RELEASE 5.10.1-RELEASE 5.10-RELEASE 5.9.2-RELEASE"
-
+            echo ">>> 方式B：下载 LLVM 官方发布版（含 clang + ld64.lld）"
             TMPD="$(mktemp -d)"
-            swift_root=""
-            for v in $CANDIDATES; do
-              url="$SWIFT_BASE/swift-$v/swift-$v-$UBUNTU_TAG.tar.gz"
+            llvm_root=""
+            for ver in $LLVM_VERSIONS; do
+              url="$LLVM_BASE/$ver/LLVM-$ver-Linux-X64.tar.xz"
               echo ">>> 尝试 $url"
-              if curl -fsSL --retry 2 --max-time 900 -o "$TMPD/swift.tar.gz" "$url"; then
+              if curl -fsSL --retry 2 --max-time 900 -o "$TMPD/llvm.tar.xz" "$url"; then
                 echo "    下载成功，解压中…"
-                if tar -xzf "$TMPD/swift.tar.gz" -C "$TMPD"; then
-                  swift_root="$(find "$TMPD" -maxdepth 1 -type d -name 'swift-*' | head -1)"
-                  echo "    解压到: $swift_root"
+                if tar -xJf "$TMPD/llvm.tar.xz" -C "$TMPD" 2>/dev/null; then
+                  llvm_root="$(find "$TMPD" -maxdepth 2 -type d -name 'bin' | head -1)"
+                  llvm_root="$(dirname "$llvm_root")"
+                  echo "    解压到: $llvm_root"
                   break
                 else
                   echo "    解压失败"
                 fi
               else
-                echo "    下载失败（该版本可能不存在）"
+                echo "    下载失败"
               fi
             done
 
-            if [ -n "$swift_root" ] && [ -x "$swift_root/usr/bin/clang" ]; then
-              echo ">>> Swift 工具链内容抽样:"
-              ls "$swift_root/usr/bin" | grep -Ei 'clang|ld|lipo|install_name|ar$|ranlib' | head -20
+            if [ -n "$llvm_root" ] && [ -x "$llvm_root/bin/clang" ]; then
+              echo ">>> LLVM bin 内容抽样:"
+              ls "$llvm_root/bin" | grep -iE 'clang|ld|lipo|install_name|^ar$|ranlib' | head -20
 
-              echo ">>> 构造 $TBIN（逐个链接，避免把 Linux 版 gcc/ld 混进来）"
-              mkdir -p "$TBIN"
-              # 先清掉可能残留的错误链接（尤其是指向 GNU ld 的）
-              rm -f "$TBIN/ld" "$TBIN/lld" "$TBIN/ld64.lld"
-
-              for t in clang clang++ ar ranlib nm strip lipo install_name_tool; do
-                if [ -x "$swift_root/usr/bin/$t" ]; then
-                  ln -sfn "$swift_root/usr/bin/$t" "$TBIN/$t"
+              for t in clang clang++ ar ranlib nm strip objcopy objdump \
+                       install_name_tool lipo; do
+                if [ -x "$llvm_root/bin/$t" ]; then
+                  ln -sfn "$llvm_root/bin/$t" "$TBIN/$t"
                 else
                   s="$(command -v "$t" 2>/dev/null || true)"
                   [ -n "$s" ] && ln -sfn "$s" "$TBIN/$t"
                 fi
               done
 
-              # ---- 链接器：只认 Apple 兼容的 ld64 ----
+              # 链接器：只接受 ld64.lld / ld64.lld.darwinnew 之类，绝不接受裸 ld
               ld_src=""
-              for cand in "$swift_root/usr/bin/ld64.lld" \
-                          "$swift_root/usr/bin/ld.lld" \
-                          "$swift_root/usr/bin/ld"; do
-                if [ -x "$cand" ]; then ld_src="$cand"; break; fi
+              for cand in "$llvm_root/bin/ld64.lld" \
+                          "$llvm_root/bin/ld64.lld.darwinnew" \
+                          "$llvm_root/bin/ld.lld"; do
+                [ -x "$cand" ] && { ld_src="$cand"; break; }
               done
-              if [ -z "$ld_src" ]; then
-                ld_src="$(command -v ld64.lld 2>/dev/null || true)"
-              fi
               if [ -n "$ld_src" ]; then
-                echo "    链接器来源: $ld_src"
+                echo ">>> 链接器来源: $ld_src"
                 ln -sfn "$ld_src" "$TBIN/ld"
                 ln -sfn "$ld_src" "$TBIN/ld64.lld"
-                ln -sfn "$ld_src" "$TBIN/lld"
               else
-                echo "    !!! Swift 工具链里没找到 ld64.lld / ld.lld"
+                echo "!!! LLVM 包里没找到 ld64.lld"
               fi
+              echo ">>> 方式B 生成后的 $TBIN:"; ls -la "$TBIN" | head -30
             else
-              echo "!!! 方式B 失败：没找到可用的 Swift 工具链"
+              echo "!!! 方式B 失败：没拿到可用的 LLVM"
             fi
             rm -rf "$TMPD"
           fi
-          if toolchain_ok; then
-            echo ">>> 方式B 后工具链可用"
-            show_ld
-          else
-            echo ">>> 方式B 后工具链仍不可用"
+          if toolchain_ok; then echo ">>> 方式B 完整可用"; show_state; fi
+
+          # ---------------- 方式C：只补链接器（复用方式A 的 clang）----------------
+          # 场景：get-toolchain.sh 给了 clang，但它的包里没有 ld64.lld。
+          # 这时只需要从 LLVM 包里单独取 ld64.lld 补上。
+          if ! toolchain_ok && [ -x "$TBIN/clang" ]; then
+            echo
+            echo ">>> 方式C：已有 clang，仅补一个 Apple 链接器"
+            TMPD="$(mktemp -d)"
+            for ver in $LLVM_VERSIONS; do
+              url="$LLVM_BASE/$ver/LLVM-$ver-Linux-X64.tar.xz"
+              echo ">>> 尝试 $url"
+              if curl -fsSL --retry 2 --max-time 900 -o "$TMPD/llvm.tar.xz" "$url"; then
+                if tar -xJf "$TMPD/llvm.tar.xz" -C "$TMPD" 2>/dev/null; then
+                  found="$(find "$TMPD" -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
+                  if [ -n "$found" ]; then
+                    echo ">>> 取到: $found"
+                    cp -f "$found" "$TBIN/ld64.lld"
+                    chmod +x "$TBIN/ld64.lld"
+                    ln -sfn "$TBIN/ld64.lld" "$TBIN/ld"
+                    break
+                  fi
+                fi
+              fi
+              echo "    该版本不可用"
+            done
+            rm -rf "$TMPD"
+            if toolchain_ok; then echo ">>> 方式C 完整可用"; show_state; fi
           fi
 
-          # ---------------- 方式C：LLVM 系统工具 + ld64.lld ----------------
-          # 注意：这里**绝不允许**把裸 `ld` 当作链接器。Ubuntu 的 /usr/bin/ld 是
-          # GNU ld，会把 Apple 参数全部判为 unknown argument —— 这正是上次失败的原因。
-          # 因此要求 ld64.lld 必须真实存在，否则本方式直接放弃。
+          # ---------------- 方式D：Swift 官方工具链（最后手段）----------------
           if ! toolchain_ok; then
             echo
-            echo ">>> 方式C：系统 LLVM + ld64.lld"
-
-            SYSCLANG="$(command -v clang || true)"
-            LD64="$(command -v ld64.lld || true)"
-            # 有些发行版把 ld64.lld 放在 llvm 版本化目录里
-            if [ -z "$LD64" ]; then
-              LD64="$(ls /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null | head -1 || true)"
-            fi
-            if [ -z "$LD64" ]; then
-              LD64="$(find /usr -name 'ld64.lld*' -type f 2>/dev/null | head -1 || true)"
-            fi
-
-            echo "    clang  = ${SYSCLANG:-未找到}"
-            echo "    ld64.lld = ${LD64:-未找到}"
-
-            if [ -n "$SYSCLANG" ] && [ -n "$LD64" ] && [ -x "$LD64" ]; then
-              mkdir -p "$TBIN"
-              ln -sfn "$SYSCLANG" "$TBIN/clang"
-              [ -x "$(command -v clang++ 2>/dev/null || echo /nonexistent)" ] && \
-                ln -sfn "$(command -v clang++)" "$TBIN/clang++"
-              for t in ar ranlib nm strip objcopy objdump; do
-                s="$(command -v "$t" 2>/dev/null || true)"
-                [ -n "$s" ] && ln -sfn "$s" "$TBIN/$t"
+            echo ">>> 方式D：尝试 Swift 官方工具链"
+            TMPD="$(mktemp -d)"
+            swift_root=""
+            for v in 6.0.3-RELEASE 6.0-RELEASE 5.10.1-RELEASE 5.9.2-RELEASE; do
+              url="https://download.swift.org/swift-release/ubuntu2204/swift-$v/swift-$v-ubuntu22.04.tar.gz"
+              echo ">>> 尝试 $url"
+              if curl -fsSL --retry 2 --max-time 900 -o "$TMPD/swift.tar.gz" "$url"; then
+                if tar -xzf "$TMPD/swift.tar.gz" -C "$TMPD" 2>/dev/null; then
+                  swift_root="$(find "$TMPD" -maxdepth 1 -type d -name 'swift-*' | head -1)"
+                  echo "    解压到: $swift_root"
+                  break
+                fi
+              fi
+              echo "    不可用"
+            done
+            if [ -n "$swift_root" ] && [ -x "$swift_root/usr/bin/clang" ]; then
+              ln -sfn "$swift_root/usr/bin/clang" "$TBIN/clang"
+              for t in clang++ ar ranlib nm strip; do
+                [ -x "$swift_root/usr/bin/$t" ] && ln -sfn "$swift_root/usr/bin/$t" "$TBIN/$t"
               done
-              ln -sfn "$LD64" "$TBIN/ld"
-              ln -sfn "$LD64" "$TBIN/ld64.lld"
-              echo ">>> 方式C 生成内容:"
-              ls -la "$TBIN" | head -30
-            else
-              echo "    !!! 缺少 clang 或 ld64.lld，放弃方式C"
-              echo "    !!! 刻意不使用 GNU ld 兜底 —— 那会导致链接阶段全线报错"
+              ldsrc="$(find "$swift_root" -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
+              if [ -n "$ldsrc" ]; then
+                ln -sfn "$ldsrc" "$TBIN/ld"; ln -sfn "$ldsrc" "$TBIN/ld64.lld"
+              else
+                echo "    !!! Swift 包里没有 ld64.lld（这正是之前链接失败的原因）"
+              fi
             fi
-          fi
-          if toolchain_ok; then
-            echo ">>> 方式C 后工具链可用"
-            show_ld
-          else
-            echo ">>> 方式C 后工具链仍不可用"
+            rm -rf "$TMPD"
           fi
 
-          # ---------------- 硬校验 ----------------
+          # ---------------- 硬校验：工具链 ----------------
           echo
           echo "=============================================================="
           echo ">>> 工具链校验"
           echo "=============================================================="
-          ls -la "$THEOS/toolchain" 2>/dev/null || echo "  (toolchain 目录不存在)"
-          echo "--- $TBIN ---"
-          ls -la "$TBIN" 2>/dev/null | head -30 || echo "  (不存在)"
-          echo "--- clang 版本 ---"
-          "$TBIN/clang" --version 2>&1 | head -3 || true
-          echo "--- ld 身份（必须是 ld64，不能是 GNU ld）---"
-          show_ld || true
-
+          echo "--- $TBIN ---"; ls -la "$TBIN" 2>/dev/null | head -30 || echo "  (不存在)"
+          show_state || true
           if toolchain_ok; then
             echo "工具链校验通过"
           else
             echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-            echo "!!! 工具链不满足要求（需要可用的 clang + Apple 兼容的 ld64）。"
-            echo "!!! 常见原因："
-            echo "!!!   1. get-toolchain.sh 失败（看方式A 的完整输出）"
-            echo "!!!   2. Swift 工具链下载地址全部 404（看方式B）"
-            echo "!!!   3. 只找到 GNU ld —— 这种情况不能用，必须拿到 ld64.lld"
-            echo "!!! 请把上面完整输出发给我。"
+            echo "!!! 工具链不满足要求：需要 clang + Apple 兼容链接器(ld64/ld64.lld)。"
+            echo "!!! 若上面显示 ld 指向 GNU ld，说明降级路径又被触发了。"
+            echo "!!! 请把完整输出发给我。"
             echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
             exit 1
           fi
 
-      - name: 安装 iOS SDK（三级回退，失败即报错）
+      # =====================================================================
+      # iOS SDK
+      # =====================================================================
+      - name: 安装 iOS SDK
         run: |
           set -uo pipefail
 
@@ -318,22 +287,15 @@ jobs:
             ls "$THEOS/sdks" | grep -qi '^iPhoneOS.*\.sdk$'
           }
 
-          # ---------------- 方式A：直接克隆 theos/sdks ----------------
-          echo "=============================================================="
           echo ">>> 方式A：git clone theos/sdks"
-          echo "=============================================================="
           rm -rf "$THEOS/sdks"
           git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks" \
-            || echo "!!! 克隆 theos/sdks 失败"
+            || echo "!!! 克隆失败"
           ls "$THEOS/sdks" 2>/dev/null | head -20 || true
           sdk_ok && echo ">>> 方式A 成功" || echo ">>> 方式A 未成功"
 
-          # ---------------- 方式B：下载归档包 ----------------
           if ! sdk_ok; then
-            echo
-            echo "=============================================================="
-            echo ">>> 方式B：下载 theos/sdks 的 tar.gz 归档"
-            echo "=============================================================="
+            echo ">>> 方式B：下载 theos/sdks 归档"
             mkdir -p "$THEOS/sdks"
             TMPD="$(mktemp -d)"
             got=0
@@ -343,7 +305,7 @@ jobs:
               "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master"
             do
               echo ">>> 尝试 $u"
-              if curl -fsSL --retry 3 --max-time 600 -o "$TMPD/sdks.tar.gz" "$u"; then
+              if curl -fsSL --retry 3 --max-time 900 -o "$TMPD/sdks.tar.gz" "$u"; then
                 if tar -xzf "$TMPD/sdks.tar.gz" -C "$TMPD"; then
                   find "$TMPD" -maxdepth 3 -name '*.sdk' -type d \
                     -exec cp -R {} "$THEOS/sdks/" \; && got=1
@@ -355,31 +317,68 @@ jobs:
             [ "$got" = "1" ] && echo ">>> 方式B 成功" || echo "!!! 方式B 失败"
           fi
 
-          # ---------------- 方式C：调用 Theos 自带脚本 ----------------
           if ! sdk_ok && [ -x "$THEOS/bin/get-sdks.sh" ]; then
-            echo
             echo ">>> 方式C：$THEOS/bin/get-sdks.sh"
             "$THEOS/bin/get-sdks.sh" || echo "!!! get-sdks.sh 返回非 0"
           fi
 
-          # ---------------- 硬校验 ----------------
-          echo
-          echo "=============================================================="
-          echo ">>> SDK 校验"
-          echo "=============================================================="
-          echo "--- \$THEOS/sdks 内容 ---"
-          ls -la "$THEOS/sdks" 2>/dev/null || echo "  (不存在)"
+          echo "--- \$THEOS/sdks ---"; ls -la "$THEOS/sdks" 2>/dev/null || echo "  (不存在)"
           if sdk_ok; then
             echo "SDK 校验通过"
           else
-            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
             echo "!!! 仍然没有可用 SDK，构建必然失败。"
-            echo "!!! 请把上面完整输出发给我。"
-            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
             exit 1
           fi
 
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+      # =====================================================================
+      # 真实链接自检：用最小 dylib 验证 clang + ld64 + SDK 能协同工作。
+      # 这一步是本次新增的关键保险 —— 让「链接器不对」在构建业务代码之前
+      # 就暴露，而不是等到打包阶段才以一堆 unknown argument 的形式出现。
+      # =====================================================================
+      - name: 链接自检（最小 dylib）
+        run: |
+          set -uo pipefail
+          TBIN="$THEOS/toolchain/linux/iphone/bin"
+          SDK="$(ls -d "$THEOS"/sdks/iPhoneOS*.sdk 2>/dev/null | sort -V | tail -1)"
+          echo ">>> 使用 SDK: $SDK"
+
+          TMPD="$(mktemp -d)"
+          cat > "$TMPD/t.m" <<'EOF'
+          #import <Foundation/Foundation.h>
+          static int zz_selftest(void) { return 7; }
+          EOF
+
+          fail=0
+          for arch in arm64 arm64e; do
+            echo ">>> 尝试链接 $arch"
+            if "$TBIN/clang" -x objective-c -c "$TMPD/t.m" -o "$TMPD/t-$arch.o" \
+                 -target "$arch-apple-ios15.0" -isysroot "$SDK" -fobjc-arc 2>&1 | tail -5; then
+              if "$TBIN/clang" -dynamiclib -arch "$arch" -isysroot "$SDK" \
+                   -miphoneos-version-min=15.0 -framework Foundation \
+                   "$TMPD/t-$arch.o" -o "$TMPD/t-$arch.dylib" 2>&1 | tail -10; then
+                if [ -f "$TMPD/t-$arch.dylib" ]; then
+                  echo "    $arch 链接成功 ($(stat -c%s "$TMPD/t-$arch.dylib") 字节)"
+                else
+                  echo "    !!! $arch 未生成产物"; fail=1
+                fi
+              else
+                echo "    !!! $arch 链接失败"; fail=1
+              fi
+            else
+              echo "    !!! $arch 编译失败"; fail=1
+            fi
+          done
+          rm -rf "$TMPD"
+
+          if [ "$fail" = "0" ]; then
+            echo ">>> 链接自检通过：clang + 链接器 + SDK 协同正常"
+          else
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "!!! 链接自检失败 —— 工具链或 SDK 有问题，业务代码必然也构建不了。"
+            echo "!!! 请把上面输出发给我。"
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            exit 1
+          fi
 
       - name: 从原始 deb 中取出两个 dylib 与 plist
         run: |
@@ -392,49 +391,38 @@ jobs:
             find "$TMP" -name '*.dylib' -exec cp -v {} vendor/ \;
             find "$TMP" -name '*.plist' -path '*DynamicLibraries*' -exec cp -v {} vendor/ \;
           done
-          echo ">>> vendor 内容:"
-          ls -la vendor/
-          test -f "vendor/转转找鸡.dylib"    || (echo "错误：缺少 转转找鸡.dylib"; exit 1)
-          test -f "vendor/ShuiShuiZZFilter.dylib" || (echo "错误：缺少 ShuiShuiZZFilter.dylib"; exit 1)
+          echo ">>> vendor:"; ls -la vendor/
+          test -f "vendor/转转找鸡.dylib" || (echo "缺少 转转找鸡.dylib"; exit 1)
+          test -f "vendor/ShuiShuiZZFilter.dylib" || (echo "缺少 ShuiShuiZZFilter.dylib"; exit 1)
 
       - name: 给原始 dylib 重新签名
         run: |
           set -e
-          for d in vendor/*.dylib; do
-            echo ">>> ldid -S $d"
-            ldid -S "$d"
-          done
+          for d in vendor/*.dylib; do echo ">>> ldid -S $d"; ldid -S "$d"; done
 
       - name: 构建 deb
         run: |
           set -e
           make clean 2>/dev/null || true
           make package FINALPACKAGE=1
-          echo ">>> 产物:"
-          find . -maxdepth 2 -name '*.deb' -exec ls -la {} \;
+          echo ">>> 产物:"; find . -maxdepth 2 -name '*.deb' -exec ls -la {} \;
 
       - name: 检查 deb 内容
         run: |
           set -e
           DEB=$(find . -maxdepth 2 -name '*.deb' | head -1)
           echo ">>> deb = $DEB"
-          echo "----- control -----"
-          dpkg-deb -I "$DEB"
-          echo "----- 文件清单 -----"
-          dpkg-deb -c "$DEB"
-          echo "----- dylib 架构与签名校验 -----"
+          echo "----- control -----"; dpkg-deb -I "$DEB"
+          echo "----- 文件清单 -----"; dpkg-deb -c "$DEB"
+          echo "----- dylib 校验 -----"
           rm -rf /tmp/chk && mkdir -p /tmp/chk
           dpkg-deb -x "$DEB" /tmp/chk
           for d in /tmp/chk/Library/MobileSubstrate/DynamicLibraries/*.dylib; do
             echo "--- $(basename "$d")"
             file "$d" | sed 's/^/    /'
-            if ldid -e "$d" >/dev/null 2>&1; then
-              echo "    签名: OK"
-            else
-              echo "    签名: 缺失或未识别"
-            fi
+            ldid -e "$d" >/dev/null 2>&1 && echo "    签名: OK" || echo "    签名: 缺失"
           done
-          echo "----- 最终 dylib 清单（应为 3 个）-----"
+          echo "----- 最终清单（应为 3 个 dylib）-----"
           ls /tmp/chk/Library/MobileSubstrate/DynamicLibraries/
 
       - name: 上传 deb
