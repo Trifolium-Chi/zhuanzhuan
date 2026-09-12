@@ -75,51 +75,51 @@ ZZMergeBridge_FRAMEWORKS = UIKit Foundation
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ---------------------------------------------------------------------------
-# 在 staging 完成后、真正打 deb 之前，把两个原始 dylib 与 plist 一起塞进去
+# 打包含义开关
+#
+#   BUNDLE_BASE=0（默认，推荐）
+#       只产出「附加插件」：ZZMergeBridge.dylib + .plist
+#       找鸡由你自己保留，本包不碰它。
+#       —— 这是符合需求的形态：把两个功能「加进」找鸡，而不是替换/合并文件。
+#
+#   BUNDLE_BASE=1
+#       额外把原版 转转找鸡.dylib/.plist 也打进包（一键安装用）。
+#       注意：这条路径会覆盖你原有的找鸡，且一旦找鸡本身出问题会一起崩。
+#
+# 用法：  make package FINALPACKAGE=1 BUNDLE_BASE=1
 # ---------------------------------------------------------------------------
+BUNDLE_BASE ?= 0
+export BUNDLE_BASE
+
 DYLIB_DEST = $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries
 
-# vendor/ 里的原始 dylib 由 CI（或 build_local.sh）从 vendor_src/*.deb 解出。
-# 这里再加一层保险：若 vendor/ 为空，就在构建期现解一次。
-vendor-guard::
-	@mkdir -p "$(THEOS_PROJECT_DIR)/vendor"
-	@if ! ls "$(THEOS_PROJECT_DIR)"/vendor/*.dylib >/dev/null 2>&1; then \
-		echo ">>> [ZZMerge] vendor/ 为空，尝试从 vendor_src/*.deb 现场解包"; \
-		command -v dpkg-deb >/dev/null 2>&1 || \
-			(echo ">>> [ZZMerge] 错误：缺少 dpkg-deb，无法解包"; exit 1); \
-		TMP="$$(mktemp -d)"; \
-		for f in "$(THEOS_PROJECT_DIR)"/vendor_src/*.deb; do \
-			[ -e "$$f" ] || continue; \
-			echo "    - $$f"; \
-			dpkg-deb -x "$$f" "$$TMP"; \
-			find "$$TMP" -name '*.dylib' -exec cp -f {} "$(THEOS_PROJECT_DIR)/vendor/" \; ; \
-			find "$$TMP" -name '*.plist' -path '*DynamicLibraries*' \
-				-exec cp -f {} "$(THEOS_PROJECT_DIR)/vendor/" \; ; \
-		done; \
-		rm -rf "$$TMP"; \
-	fi
-
-internal-stage:: vendor-guard
-	@echo ">>> [ZZMerge] 把原始 dylib 并入打包目录"
+internal-stage::
+	@echo ">>> [ZZMerge] staging 收尾（BUNDLE_BASE=$(BUNDLE_BASE)）"
 	@mkdir -p "$(DYLIB_DEST)"
-	@for f in $(THEOS_PROJECT_DIR)/vendor/*.dylib; do \
-		[ -e "$$f" ] || continue; \
-		cp -f "$$f" "$(DYLIB_DEST)/"; \
-		echo "    + $$(basename "$$f")"; \
+ifeq ($(BUNDLE_BASE),1)
+	@echo ">>> BUNDLE_BASE=1：把原版「转转找鸡」也并入打包目录"
+	@echo ">>> 注意：这会在安装时覆盖你原有的找鸡"
+	@for f in "$(THEOS_PROJECT_DIR)/vendor/转转找鸡.dylib" \
+	          "$(THEOS_PROJECT_DIR)/vendor/转转找鸡.plist"; do \
+		if [ -e "$$f" ]; then \
+			cp -f "$$f" "$(DYLIB_DEST)/"; \
+			echo "    + $$(basename "$$f")"; \
+		else \
+			echo "    !!! 缺少 $$f（需要先解出 vendor/）"; exit 1; \
+		fi; \
 	done
-	@for f in $(THEOS_PROJECT_DIR)/vendor/*.plist; do \
-		[ -e "$$f" ] || continue; \
-		cp -f "$$f" "$(DYLIB_DEST)/"; \
-		echo "    + $$(basename "$$f")"; \
-	done
+else
+	@echo ">>> BUNDLE_BASE=0：只出附加插件，不动你原有的找鸡"
+	@echo ">>> 水水同样不进包（桥接层已自行实现其两项功能）"
+endif
 	@echo ">>> [ZZMerge] 打包目录内容："
-	@ls -la "$(DYLIB_DEST)/"
-	@test -f "$(DYLIB_DEST)/转转找鸡.dylib" || \
-		(echo ">>> [ZZMerge] 错误：缺少 vendor/转转找鸡.dylib"; exit 1)
-	@test -f "$(DYLIB_DEST)/ShuiShuiZZFilter.dylib" || \
-		(echo ">>> [ZZMerge] 错误：缺少 vendor/ShuiShuiZZFilter.dylib"; exit 1)
+	@ls -la "$(DYLIB_DEST)/" 2>/dev/null || true
 	@test -f "$(DYLIB_DEST)/ZZMergeBridge.dylib" || \
-		(echo ">>> [ZZMerge] 警告：桥接 dylib 未出现在打包目录（编译可能失败）"; true)
+		(echo ">>> [ZZMerge] 错误：桥接 dylib 未生成，编译可能失败"; exit 1)
+	@test -f "$(DYLIB_DEST)/ZZMergeBridge.plist" || \
+		(echo ">>> [ZZMerge] 错误：桥接 plist 未就位"; exit 1)
+	@echo ">>> 最终清单："
+	@ls -1 "$(DYLIB_DEST)/" | grep -Ev '\.(dSYM|txt|log)$$' || true
 
 after-install::
 	install.exec "killall -9 zhuanzhuan 2>/dev/null || true"
