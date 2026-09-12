@@ -537,28 +537,56 @@ jobs:
           set -e
           make clean 2>/dev/null || true
           make package FINALPACKAGE=1
-          echo ">>> 产物:"; find . -maxdepth 2 -name '*.deb' -exec ls -la {} \;
+          echo ">>> Theos 打包目录 $(pwd)/packages 内容:"
+          ls -la packages/ 2>/dev/null || echo "  (packages 目录不存在)"
+          echo ">>> 全仓库搜索 deb:"
+          find . -name '*.deb' -not -path './theos/*' -exec ls -la {} \;
+          # 把 deb 统一收集到仓库根目录的 dist/，供后续步骤与上传使用，
+          # 避免依赖 Theos 的默认输出目录（它在 _THEOS_PACKAGE_DIR / packages/ 之间可能变化）
+          mkdir -p dist
+          found=0
+          for f in packages/*.deb .theos/*.deb *.deb; do
+            [ -e "$f" ] || continue
+            cp -f "$f" dist/
+            found=$((found + 1))
+            echo ">>> 已收集: $f"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "!!! 没有找到任何 deb 产物，构建视为失败"
+            exit 1
+          fi
+          echo ">>> dist/ 内容:"; ls -la dist/
 
       - name: 检查 deb 内容
         run: |
           set -e
-          DEB=$(find . -maxdepth 2 -name '*.deb' | head -1)
+          DEB=$(ls dist/*.deb 2>/dev/null | head -1)
+          if [ -z "$DEB" ]; then
+            echo "!!! dist/ 里没有 deb"
+            ls -la dist/ 2>/dev/null || true
+            exit 1
+          fi
           echo ">>> deb = $DEB"
           echo "----- control -----"; dpkg-deb -I "$DEB"
           echo "----- 文件清单 -----"; dpkg-deb -c "$DEB"
           echo "----- dylib 校验 -----"
           rm -rf /tmp/chk && mkdir -p /tmp/chk
           dpkg-deb -x "$DEB" /tmp/chk
-          for d in /tmp/chk/Library/MobileSubstrate/DynamicLibraries/*.dylib; do
+          DLDIR=/tmp/chk/Library/MobileSubstrate/DynamicLibraries
+          for d in "$DLDIR"/*.dylib; do
             echo "--- $(basename "$d")"; file "$d" | sed 's/^/    /'
             ldid -e "$d" >/dev/null 2>&1 && echo "    签名: OK" || echo "    签名: 缺失"
           done
-          echo "----- 最终清单（应为 3 个 dylib）-----"
-          ls /tmp/chk/Library/MobileSubstrate/DynamicLibraries/
+          echo "----- 最终清单（应为 3 个 dylib + 3 个 plist）-----"
+          ls -la "$DLDIR"
 
       - name: 上传 deb
         uses: actions/upload-artifact@v4
         with:
           name: zzmerge-deb
-          path: "*.deb"
+          # Theos 的 deb 默认生成在 $(THEOS_PROJECT_DIR)/packages/ 下，不在仓库根目录。
+          # 早先写成 "*.deb" 只在根目录匹配，因此报
+          #   "No files were found with the provided path: *.deb"
+          # 现在构建步骤已把产物统一收集到 dist/，这里直接取 dist/*.deb。
+          path: dist/*.deb
           if-no-files-found: error
