@@ -35,35 +35,169 @@ jobs:
       - name: 取源码
         uses: actions/checkout@v4
 
-      - name: 安装依赖
+      - name: 安装构建依赖（含编译工具链依赖）
         run: |
+          set -e
           sudo apt-get update
+          # clang/lld/gold 等是"系统 clang 兜底"路径要用的；
+          # libtinfo5 部分脚本会依赖，装不上不算致命。
           sudo apt-get install -y --no-install-recommends \
-            fakeroot git make perl xz-utils curl ca-certificates dpkg
+            fakeroot git make perl xz-utils curl ca-certificates dpkg \
+            file zstd unzip zip rsync \
+            clang lld llvm binutils
+          sudo apt-get install -y --no-install-recommends libtinfo5 \
+            || echo "!!! libtinfo5 装不上（继续）"
+
+          echo ">>> 系统编译器版本:"
+          clang --version | head -3
+          which ld64.lld ld.lld lld 2>/dev/null || echo "  (未找到 lld 变体)"
+
           mkdir -p "$HOME/.local/bin"
-          curl -sSL -o "$HOME/.local/bin/ldid" \
+          curl -fsSL -o "$HOME/.local/bin/ldid" \
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
           chmod +x "$HOME/.local/bin/ldid"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/ldid" -h 2>&1 | head -2 || true
 
-      - name: 安装 Theos 与 iOS SDK（三级回退，失败即报错）
+      - name: 克隆 Theos
         run: |
-          set -uo pipefail   # 注意：这里先不用 -e，我们要自己控制每一步的失败处理
-
-          echo "=============================================================="
-          echo ">>> 1. 克隆 Theos"
-          echo "=============================================================="
+          set -e
           rm -rf "$THEOS"
-          if ! git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"; then
-            echo "!!! 克隆 theos/theos 失败"
-            exit 1
-          fi
-          # 浅克隆有时拿不全递归子模块，补一次（失败不算致命，后面还有回退）
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
           git -C "$THEOS" submodule update --init --recursive --recommend-shallow \
             || echo "!!! 子模块补充失败（继续）"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo ">>> Theos 目录:"
           ls "$THEOS"
           echo ">>> 当前 Theos 支持的 package scheme（用于核对）:"
           ls "$THEOS/makefiles/package" 2>/dev/null || echo "  (无 package 目录)"
+
+      # =========================================================================
+      # 工具链：这是本次失败的直接原因（toolchain/linux/iphone/bin/clang 不存在）
+      # 三级策略 + 硬校验，任何一级成功即止；全失败则打印诊断并退出
+      # =========================================================================
+      - name: 安装编译工具链（三级回退，失败即报错）
+        run: |
+          set -uo pipefail
+
+          TOOLCHAIN_DIR="$THEOS/toolchain/linux/iphone"
+
+          toolchain_ok() {
+            [ -x "$TOOLCHAIN_DIR/bin/clang" ]
+          }
+
+          echo "=============================================================="
+          echo ">>> 工具链目标目录: $TOOLCHAIN_DIR"
+          echo "=============================================================="
+
+          # ---------------- 方式A：scripts/get-toolchain.sh ----------------
+          echo
+          echo ">>> 方式A：$THEOS/bin/get-toolchain.sh"
+          if [ -x "$THEOS/bin/get-toolchain.sh" ]; then
+            "$THEOS/bin/get-toolchain.sh" || echo "!!! get-toolchain.sh 返回非 0"
+          else
+            echo "!!! 找不到 $THEOS/bin/get-toolchain.sh"
+          fi
+          toolchain_ok && echo ">>> 方式A 成功" || echo ">>> 方式A 未成功"
+
+          # ---------------- 方式B：直接下载 Swift 工具链 ----------------
+          if ! toolchain_ok; then
+            echo
+            echo ">>> 方式B：下载 Swift 官方工具链（含可用于交叉编译的 clang）"
+
+            SWIFT_BASE="https://download.swift.org/swift-release/ubuntu2204"
+            UBUNTU_TAG="ubuntu22.04"
+            CANDIDATES="6.0.3-RELEASE 6.0.2-RELEASE 6.0.1-RELEASE 6.0-RELEASE 5.10.1-RELEASE 5.10-RELEASE 5.9.2-RELEASE"
+
+            TMPD="$(mktemp -d)"
+            swift_root=""
+            for v in $CANDIDATES; do
+              url="$SWIFT_BASE/swift-$v/swift-$v-$UBUNTU_TAG.tar.gz"
+              echo ">>> 尝试 $url"
+              if curl -fsSL --retry 2 --max-time 600 -o "$TMPD/swift.tar.gz" "$url"; then
+                echo "    下载成功，解压中…"
+                if tar -xzf "$TMPD/swift.tar.gz" -C "$TMPD"; then
+                  swift_root="$(find "$TMPD" -maxdepth 1 -type d -name 'swift-*' | head -1)"
+                  echo "    解压到: $swift_root"
+                  break
+                else
+                  echo "    解压失败"
+                fi
+              else
+                echo "    下载失败（可能该版本不存在）"
+              fi
+            done
+
+            if [ -n "$swift_root" ] && [ -x "$swift_root/usr/bin/clang" ]; then
+              echo ">>> 把 Swift 工具链链接到 $TOOLCHAIN_DIR"
+              mkdir -p "$(dirname "$TOOLCHAIN_DIR")"
+              rm -rf "$TOOLCHAIN_DIR"
+              ln -sfn "$swift_root/usr" "$TOOLCHAIN_DIR"
+              echo ">>> 链接结果: $(readlink -f "$TOOLCHAIN_DIR" 2>/dev/null || echo '?')"
+            else
+              echo "!!! 方式B 失败：没找到可用的 Swift 工具链"
+            fi
+            rm -rf "$TMPD"
+          fi
+          toolchain_ok && echo ">>> 方式B 后工具链可用" || echo ">>> 方式B 后工具链仍不可用"
+
+          # ---------------- 方式C：系统 clang 兜底 ----------------
+          # clang 本身就能产出 Mach-O 目标，配上 theos 传的 -isysroot 即可交叉编译。
+          # 这样即使 Swift 工具链下载不到（网络受限），依然有机会构建成功。
+          if ! toolchain_ok; then
+            echo
+            echo ">>> 方式C：用系统 clang 构造 Theos 期望的工具链目录"
+            SYSCLANG="$(command -v clang || true)"
+            SYSLD="$(command -v ld64.lld || command -v ld.lld || command -v lld || true)"
+            echo "    clang = ${SYSCLANG:-未找到}"
+            echo "    ld    = ${SYSLD:-未找到}"
+
+            if [ -n "$SYSCLANG" ]; then
+              mkdir -p "$TOOLCHAIN_DIR/bin"
+              for tool in clang clang++ cc c++ ld lld ar ranlib nm strip objcopy \
+                          objdump lipo install_name_tool; do
+                # 只为系统真实存在的工具建立链接
+                case "$tool" in
+                  clang|clang++) src="$SYSCLANG" ;;
+                  cc)            src="$(command -v clang)" ;;
+                  c++)           src="$(command -v clang++)" ;;
+                  ld|lld)        src="$SYSLD" ;;
+                  *)             src="$(command -v "$tool" 2>/dev/null || true)" ;;
+                esac
+                [ -n "$src" ] && [ -x "$src" ] && ln -sfn "$src" "$TOOLCHAIN_DIR/bin/$tool"
+              done
+              # ld64.lld 若存在，优先给 ld 用（Apple 目标更合适）
+              if command -v ld64.lld >/dev/null 2>&1; then
+                ln -sfn "$(command -v ld64.lld)" "$TOOLCHAIN_DIR/bin/ld"
+                ln -sfn "$(command -v ld64.lld)" "$TOOLCHAIN_DIR/bin/ld64.lld"
+              fi
+              echo ">>> 方式C 生成内容:"
+              ls -la "$TOOLCHAIN_DIR/bin/" | head -30
+            fi
+          fi
+          toolchain_ok && echo ">>> 方式C 后工具链可用" || echo ">>> 方式C 后工具链仍不可用"
+
+          # ---------------- 硬校验 ----------------
+          echo
+          echo "=============================================================="
+          echo ">>> 工具链校验"
+          echo "=============================================================="
+          ls -la "$THEOS/toolchain" 2>/dev/null || echo "  (toolchain 目录不存在)"
+          if toolchain_ok; then
+            echo ">>> clang 可用性测试:"
+            "$TOOLCHAIN_DIR/bin/clang" --version 2>&1 | head -3 || true
+            echo "工具链校验通过"
+          else
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "!!! 仍然没有可用工具链，构建必然失败。"
+            echo "!!! 请把上面完整输出发给我。"
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            exit 1
+          fi
+
+      - name: 安装 iOS SDK（三级回退，失败即报错）
+        run: |
+          set -uo pipefail
 
           sdk_ok() {
             [ -d "$THEOS/sdks" ] && \
@@ -71,33 +205,21 @@ jobs:
             ls "$THEOS/sdks" | grep -qi '^iPhoneOS.*\.sdk$'
           }
 
-          echo
+          # ---------------- 方式A：直接克隆 theos/sdks ----------------
           echo "=============================================================="
-          echo ">>> 2. 方式A：官方脚本 theos/bin/get-toolchain.sh"
+          echo ">>> 方式A：git clone theos/sdks"
           echo "=============================================================="
-          if [ -x "$THEOS/bin/get-toolchain.sh" ]; then
-            "$THEOS/bin/get-toolchain.sh" || echo "!!! get-toolchain.sh 返回非 0"
-          else
-            echo "!!! 找不到 get-toolchain.sh"
-          fi
-          echo ">>> 方式A 之后的 SDK 目录："
-          ls -la "$THEOS/sdks" 2>/dev/null || echo "  (sdks 目录不存在)"
+          rm -rf "$THEOS/sdks"
+          git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks" \
+            || echo "!!! 克隆 theos/sdks 失败"
+          ls "$THEOS/sdks" 2>/dev/null | head -20 || true
+          sdk_ok && echo ">>> 方式A 成功" || echo ">>> 方式A 未成功"
 
+          # ---------------- 方式B：下载归档包 ----------------
           if ! sdk_ok; then
             echo
             echo "=============================================================="
-            echo ">>> 3. 方式B：直接克隆 theos/sdks 仓库"
-            echo "=============================================================="
-            rm -rf "$THEOS/sdks"
-            git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks" \
-              || echo "!!! 克隆 theos/sdks 失败"
-            ls -la "$THEOS/sdks" 2>/dev/null | head -30 || true
-          fi
-
-          if ! sdk_ok; then
-            echo
-            echo "=============================================================="
-            echo ">>> 4. 方式C：从 SDK 归档包手动解出"
+            echo ">>> 方式B：下载 theos/sdks 的 tar.gz 归档"
             echo "=============================================================="
             mkdir -p "$THEOS/sdks"
             TMPD="$(mktemp -d)"
@@ -108,7 +230,7 @@ jobs:
               "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master"
             do
               echo ">>> 尝试 $u"
-              if curl -fsSL --retry 3 --max-time 300 -o "$TMPD/sdks.tar.gz" "$u"; then
+              if curl -fsSL --retry 3 --max-time 600 -o "$TMPD/sdks.tar.gz" "$u"; then
                 if tar -xzf "$TMPD/sdks.tar.gz" -C "$TMPD"; then
                   find "$TMPD" -maxdepth 3 -name '*.sdk' -type d \
                     -exec cp -R {} "$THEOS/sdks/" \; && got=1
@@ -117,30 +239,28 @@ jobs:
               fi
             done
             rm -rf "$TMPD"
-            if [ "$got" = "1" ]; then
-              echo ">>> 方式C 成功"
-            else
-              echo "!!! 方式C 也失败"
-            fi
+            [ "$got" = "1" ] && echo ">>> 方式B 成功" || echo "!!! 方式B 失败"
           fi
 
-          # ---- 硬校验 ----
+          # ---------------- 方式C：调用 Theos 自带脚本 ----------------
+          if ! sdk_ok && [ -x "$THEOS/bin/get-sdks.sh" ]; then
+            echo
+            echo ">>> 方式C：$THEOS/bin/get-sdks.sh"
+            "$THEOS/bin/get-sdks.sh" || echo "!!! get-sdks.sh 返回非 0"
+          fi
+
+          # ---------------- 硬校验 ----------------
           echo
           echo "=============================================================="
-          echo ">>> 5. 校验"
+          echo ">>> SDK 校验"
           echo "=============================================================="
-          echo "THEOS=$THEOS"
           echo "--- \$THEOS/sdks 内容 ---"
           ls -la "$THEOS/sdks" 2>/dev/null || echo "  (不存在)"
-          echo "--- 工具链 ---"
-          ls -la "$THEOS/toolchain" 2>/dev/null || echo "  (不存在)"
-
           if sdk_ok; then
             echo "SDK 校验通过"
           else
             echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
             echo "!!! 仍然没有可用 SDK，构建必然失败。"
-            echo "!!! 可能原因：GitHub 到 theos 仓库网络受限 / 配额 / 仓库改名。"
             echo "!!! 请把上面完整输出发给我。"
             echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
             exit 1
