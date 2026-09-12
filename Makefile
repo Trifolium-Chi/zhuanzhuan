@@ -42,7 +42,26 @@
 # Pre-Depends（去掉 rootless-compat）。
 # ---------------------------------------------------------------------------
 
-export ARCHS = arm64 arm64e
+# ---------------------------------------------------------------------------
+# 架构选择：只出 arm64，不出 arm64e
+#
+# 原因（已核对 Theos 源码 makefiles/instance/rules.mk 第 124-131 行）：
+#     124: # Static libraries do not support having multiple arm64e ABIs, ...
+#     125: IS_NEW_ABI := $(call __vercmp,$(_THEOS_TARGET_CC_VERSION),ge,12.0.0)
+#     127: ifneq ($(THEOS_PLATFORM_NAME),macosx)
+#     128: # On non macOS, always use old ABI as only macOS can compile with new ABI
+#     129:     IS_NEW_ABI = 0
+#   即：**在 Linux 上只能产出 arm64e 的旧 ABI**。而实际构建时链接器会报
+#       ld: warning: object file ... was built with an incompatible arm64e ABI compiler
+#   这个 arm64e 切片有无法在真机加载的风险，且 CI 里无法验证。
+#
+#   反过来，arm64 切片在 iOS 11 及以上的所有 arm64 设备上都可正常加载，
+#   而本包的依赖要求 firmware >= 15.0，所以 arm64 完全够用，且更可靠。
+#   若你确需 arm64e（例如要给 arm64e 进程原生性能），把它加回 ARCHS 即可，
+#   但要清楚那个 ABI 警告意味着什么。
+# ---------------------------------------------------------------------------
+
+export ARCHS = arm64
 export TARGET = iphone:clang:latest:15.0
 
 include $(THEOS)/makefiles/common.mk

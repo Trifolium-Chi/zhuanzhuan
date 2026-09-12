@@ -1,7 +1,7 @@
 Package: com.hang.zzzj
 Name: 转转找鸡（版本地区+收藏 合并版）
 Version: 0.0.1-9
-Architecture: iphoneos-arm64e
+Architecture: iphoneos-arm64
 Description: 转转搜索筛选助手合并版。以「找鸡」为主体（自动抓取、速度快），并在筛选面板「成色」之后加入「版本/地区」筛选，在抓取结果的「复制链接」下方加入「收藏」按钮。内部同时携带原版找鸡与水水两个 dylib，逻辑互不干扰。
 Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)
 Pre-Depends: rootless-compat (>= 0.9)
@@ -12,4 +12,4 @@ Section: Tweaks
 Priority: optional
 Author: hang + 水水（合并版）
 Maintainer: hang
-Installed-Size: 900
+Installed-Size: 740
