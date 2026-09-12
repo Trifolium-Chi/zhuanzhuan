@@ -1,19 +1,23 @@
 name: Build ZZMerge deb
 
 # 触发方式：
-#   1. 手动：Actions -> Run workflow（可选 roothide / rootless）
-#   2. 推送到 main / master 自动构建
+#   1. 推送到 main / master 自动构建
+#   2. 手动：Actions -> Run workflow
+#
+# 【重要】关于构建模式：
+#   本包刻意采用 **rootful（默认）** 构建方式，不设置 THEOS_PACKAGE_SCHEME。
+#
+#   原因：原版「转转找鸡」包就是 rootful 构建，证据是它的元数据：
+#       Pre-Depends: rootless-compat (>= 0.9)
+#       安装路径:    /Library/MobileSubstrate/DynamicLibraries/
+#   rootless-compat 这层兼容包会在无根 / RootHide 设备上把 /Library/...
+#   自动映射到真实位置（如 /var/jb/Library/...）。所以照抄它的构建方式最稳——
+#   你的设备上找鸡本来就能用，说明这条路是通的。
+#
+#   另外：Theos 官方并不存在名为 "roothide" 的 package scheme，
+#   设置它会直接报错 "'roothide' package scheme does not exist"。
 on:
   workflow_dispatch:
-    inputs:
-      scheme:
-        description: "越狱方案（roothide = RootHide/Rootless 用；rootless = 普通无根）"
-        required: true
-        default: roothide
-        type: choice
-        options:
-          - roothide
-          - rootless
   push:
     branches: [ main, master ]
 
@@ -25,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       THEOS: ${{ github.workspace }}/theos
-      THEOS_PACKAGE_SCHEME: ${{ github.event.inputs.scheme || 'roothide' }}
+      # 故意不设置 THEOS_PACKAGE_SCHEME —— 保持 rootful，与找鸡一致
 
     steps:
       - name: 取源码
@@ -36,7 +40,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             fakeroot git make perl xz-utils curl ca-certificates dpkg
-          # Theos 需要 ldid 来给 dylib 签名
           mkdir -p "$HOME/.local/bin"
           curl -sSL -o "$HOME/.local/bin/ldid" \
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
@@ -46,38 +49,39 @@ jobs:
       - name: 安装 Theos
         run: |
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          # 下载 iOS 工具链与 SDK
           "$THEOS/bin/get-toolchain.sh" 2>/dev/null || true
           if [ ! -d "$THEOS/sdks" ] || [ -z "$(ls -A "$THEOS/sdks" 2>/dev/null)" ]; then
             echo ">>> 工具链脚本未就绪，回退到 theos/sdks 仓库"
             git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
           fi
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          echo ">>> Theos 内容:"
-          ls "$THEOS"
+          echo ">>> 当前 Theos 支持的 package scheme（用于核对）:"
+          ls "$THEOS/makefiles/package" 2>/dev/null || echo "  (无 package 目录)"
           echo ">>> SDK:"
           ls "$THEOS/sdks" | head
 
       - name: 从原始 deb 中取出两个 dylib 与 plist
         run: |
           set -e
-          mkdir -p vendor /tmp/x
+          mkdir -p vendor
+          TMP="$(mktemp -d)"
           for f in vendor_src/*.deb; do
             echo ">>> 解包 $f"
-            rm -rf /tmp/x/* ; mkdir -p /tmp/x
-            dpkg-deb -x "$f" /tmp/x
-            find /tmp/x -name '*.dylib' -exec cp -v {} vendor/ \;
-            find /tmp/x -name '*.plist' -path '*DynamicLibraries*' -exec cp -v {} vendor/ \;
+            dpkg-deb -x "$f" "$TMP"
+            find "$TMP" -name '*.dylib' -exec cp -v {} vendor/ \;
+            find "$TMP" -name '*.plist' -path '*DynamicLibraries*' -exec cp -v {} vendor/ \;
           done
           echo ">>> vendor 内容:"
           ls -la vendor/
+          test -f "vendor/转转找鸡.dylib"    || (echo "错误：缺少 转转找鸡.dylib"; exit 1)
+          test -f "vendor/ShuiShuiZZFilter.dylib" || (echo "错误：缺少 ShuiShuiZZFilter.dylib"; exit 1)
 
-      - name: 给原始 dylib 重新签名（CI 环境下必须）
+      - name: 给原始 dylib 重新签名
         run: |
           set -e
           for d in vendor/*.dylib; do
             echo ">>> ldid -S $d"
-            ldid -S "$d" || echo "  (签名失败，继续，看看能否打包)"
+            ldid -S "$d"
           done
 
       - name: 构建 deb
@@ -97,19 +101,24 @@ jobs:
           dpkg-deb -I "$DEB"
           echo "----- 文件清单 -----"
           dpkg-deb -c "$DEB"
-          echo "----- dylib 架构校验 -----"
+          echo "----- dylib 架构与签名校验 -----"
           rm -rf /tmp/chk && mkdir -p /tmp/chk
           dpkg-deb -x "$DEB" /tmp/chk
           for d in /tmp/chk/Library/MobileSubstrate/DynamicLibraries/*.dylib; do
-            echo "--- $d"
-            file "$d"
-            "$THEOS/toolchain/linux/iphone/bin/ldid" -e "$d" >/dev/null 2>&1 \
-              && echo "    签名: OK" || echo "    签名: 缺失或未识别"
+            echo "--- $(basename "$d")"
+            file "$d" | sed 's/^/    /'
+            if ldid -e "$d" >/dev/null 2>&1; then
+              echo "    签名: OK"
+            else
+              echo "    签名: 缺失或未识别"
+            fi
           done
+          echo "----- 最终 dylib 清单（应为 3 个）-----"
+          ls /tmp/chk/Library/MobileSubstrate/DynamicLibraries/
 
       - name: 上传 deb
         uses: actions/upload-artifact@v4
         with:
-          name: zzmerge-deb-${{ github.event.inputs.scheme || 'roothide' }}
+          name: zzmerge-deb
           path: "*.deb"
           if-no-files-found: error
