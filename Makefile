@@ -18,12 +18,32 @@
 #
 # 本地构建：
 #   export THEOS=~/theos
-#   export THEOS_PACKAGE_SCHEME=roothide     # 或 rootless
 #   make package FINALPACKAGE=1
+#
+# ---------------------------------------------------------------------------
+# 【构建模式说明 —— 很重要，别乱改】
+#
+# 本包采用 **rootful（默认）** 方式构建，刻意不设置 THEOS_PACKAGE_SCHEME。
+#
+# 依据：原版「转转找鸡」包本身就是 rootful 构建，证据在它自己的 control 里：
+#     Pre-Depends: rootless-compat (>= 0.9)
+#     安装路径:    /Library/MobileSubstrate/DynamicLibraries/
+# rootless-compat 会在无根 / RootHide 设备上把 /Library/... 自动映射到真实路径
+# （如 /var/jb/Library/...）。既然找鸡在目标设备上能正常工作，照抄它的构建
+# 方式是最稳的选择。
+#
+# 另外：Theos 官方只有默认(rootful) 与 rootless 两个 package scheme，
+# 不存在 "roothide"；写了会直接报错
+#     *** 'roothide' package scheme does not exist.  Stop.
+#
+# 若将来确实需要换成 rootless（普通无根越狱、且设备上没装 rootless-compat），
+# 再显式导出：export THEOS_PACKAGE_SCHEME=rootless
+# 此时安装路径会自动变成 /var/jb/Library/...，且需要同步修改 control 的
+# Pre-Depends（去掉 rootless-compat）。
+# ---------------------------------------------------------------------------
 
 export ARCHS = arm64 arm64e
 export TARGET = iphone:clang:latest:15.0
-export THEOS_PACKAGE_SCHEME ?=
 
 include $(THEOS)/makefiles/common.mk
 
