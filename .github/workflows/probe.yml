@@ -1,0 +1,121 @@
+name: 探测可用下载地址（不构建）
+
+# 用途：当工具链下载地址失效时跑这个。
+# 它只发 HEAD 请求，打印每个候选 URL 的 HTTP 状态码，
+# 用来判断「是地址写错了」还是「网络拿不到」。
+#
+# 背景：我曾经凭空拼出错误的 LLVM 文件名（把 git tag 前缀 llvmorg- 拼进了文件名），
+#       也调用过根本不存在的 theos/bin/get-toolchain.sh。这个探测器的目的
+#       就是让地址问题用「实测」而不是「猜测」来解决。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 探测所有候选下载地址
+        run: |
+          set +e
+          probe() {
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 45 "$1" 2>/dev/null)
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "  [可用 HTTP $code] $1"
+            else
+              echo "  [HTTP $code] $1"
+            fi
+          }
+
+          echo "=============================================================="
+          echo "A. 基础连通性"
+          echo "=============================================================="
+          for u in \
+            https://github.com \
+            https://objects.githubusercontent.com \
+            https://download.swift.org \
+            https://raw.githubusercontent.com \
+            https://api.github.com
+          do probe "$u"; done
+
+          echo
+          echo "=============================================================="
+          echo "B. theos/sdks 仓库"
+          echo "=============================================================="
+          probe "https://github.com/theos/sdks/archive/refs/heads/master.tar.gz"
+          probe "https://github.com/theos/sdks/archive/refs/heads/main.tar.gz"
+          echo "  --- git ls-remote 测试:"
+          timeout 60 git ls-remote --heads https://github.com/theos/sdks.git 2>&1 | head -5
+
+          echo
+          echo "=============================================================="
+          echo "C. LLVM 官方发布包（关键：确认正确文件名）"
+          echo "=============================================================="
+          for ver in 18.1.8 17.0.6 16.0.6; do
+            for os in ubuntu-18.04 ubuntu-20.04 ubuntu-22.04; do
+              probe "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/clang+llvm-$ver-x86_64-linux-gnu-$os.tar.xz"
+            done
+          done
+          echo "  --- 对照：我曾经用错的形式（应全部 404）:"
+          probe "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-llvmorg-18.1.8-Linux-X64.tar.xz"
+
+          echo
+          echo "=============================================================="
+          echo "D. Swift 官方工具链（关键：确认正确路径形式）"
+          echo "=============================================================="
+          for tag in ubuntu24.04 ubuntu22.04 ubuntu20.04; do
+            for v in 6.1-RELEASE 6.0.3-RELEASE 6.0-RELEASE 5.10.1-RELEASE 5.9.2-RELEASE; do
+              probe "https://download.swift.org/swift-release/${tag//./}/swift-$v/swift-$v-$tag.tar.gz"
+            done
+          done
+          echo "  --- 另一种路径形式:"
+          for tag in ubuntu22.04; do
+            for v in 6.0.3-RELEASE 5.9.2-RELEASE; do
+              probe "https://download.swift.org/swift-$v-release/${tag//./}/swift-$v-$tag.tar.gz"
+            done
+          done
+
+          echo
+          echo "=============================================================="
+          echo "E. Ubuntu 自带 LLVM/lld（可能已含 ld64.lld）"
+          echo "=============================================================="
+          echo "  --- 先装再看看有没有 ld64.lld:"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm binutils 2>&1 | tail -5
+          echo "  clang: $(command -v clang || echo 无)"
+          clang --version 2>/dev/null | head -2
+          echo "  --- 搜索 ld64.lld:"
+          find / -name 'ld64.lld*' -type f 2>/dev/null | head -20 || echo "    (未找到)"
+          echo "  --- 系统 ld 身份（注意：这通常是 GNU ld，不能用）:"
+          ls -la /usr/bin/ld 2>/dev/null
+          /usr/bin/ld -v 2>&1 | head -2
+
+          echo
+          echo "=============================================================="
+          echo "F. Theos 官方安装脚本（用于核实它自己的下载地址）"
+          echo "=============================================================="
+          git clone --depth 1 https://github.com/theos/theos.git /tmp/theos-probe 2>&1 | tail -3
+          echo "  --- bin 内容:"
+          ls /tmp/theos-probe/bin 2>/dev/null
+          echo
+          echo "  --- swift-bootstrapper.pl 里的 URL:"
+          grep -nE 'https?://|\.tar|ubuntu|RELEASE' \
+            /tmp/theos-probe/bin/swift-bootstrapper.pl 2>/dev/null | head -30 || echo "    (无)"
+          echo
+          echo "  --- update-theos 里的 URL:"
+          grep -nE 'https?://' /tmp/theos-probe/bin/update-theos 2>/dev/null | head -20 || true
+          echo
+          echo "  --- install-theos 里的 URL:"
+          grep -nE 'https?://' /tmp/theos-probe/bin/install-theos 2>/dev/null | head -20 || true
+          echo
+          echo "  --- install-sdk 里的 URL:"
+          grep -nE 'https?://' /tmp/theos-probe/bin/install-sdk 2>/dev/null | head -20 || true
+
+          echo
+          echo "=============================================================="
+          echo "G. 顺带看 Theos 期望工具链放在哪（确认路径无误）"
+          echo "=============================================================="
+          grep -rnE 'toolchain/linux|linux/iphone' /tmp/theos-probe/makefiles/ 2>/dev/null | head -20 || true
