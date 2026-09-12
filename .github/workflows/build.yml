@@ -204,30 +204,57 @@ jobs:
             fi
           }
 
-          # ---------------- 方式A：Theos 自己用的 Swift 工具链地址 ----------------
-          # 这是 install-theos 第 437/439 行明确使用的地址，最贴近 Theos 的期望。
+          # =====================================================================
+          # 方式顺序的依据 —— 已核对 Theos 的 install-theos 源码：
+          #
+          #   第 408 行：若 $THEOS/toolchain/linux/iphone 非空，则认为已装好
+          #   第 412-415 行：
+          #       stoolchain="n"
+          #       if [[ -z $CI ]]; then read -p "支持 Swift？[y/n]" stoolchain; fi
+          #       在 CI 里 CI 变量已设置，于是跳过提问，stoolchain 保持 "n"
+          #   第 416 行：if theos_bool $stoolchain; then
+          #   第 437 行：    装了 Swift 的工具链 kabiroberai/swift-...-ubuntu20.04.tar.xz
+          #   第 461 行：否则装 L1ghtmann/llvm-project 的 iOSToolchain-$ARCH.tar.xz
+          #   第 470 行：if [[ -x $THEOS/toolchain/linux/iphone/bin/clang ]]; then  ← 权威路径
+          #
+          # 结论：**CI 环境下 install-theos 装的是 L1ghtmann 的 iOSToolchain**，
+          # 所以把它排在方式A；kabiroberai 的 Swift 版排在其后作为备选。
+          # 目标路径 $THEOS/toolchain/linux/iphone/bin/clang 也与第 470 行完全一致。
+          # =====================================================================
+
+          # ---------------- 方式A：CI 下 install-theos 实际使用的工具链 ----------------
+          # 已实测核实：iOSToolchain-x86_64.tar.xz 的归档顶层就是 linux/iphone/，
+          # 因此 `tar -xJf - -C $THEOS/toolchain/` 会精确产出
+          #     $THEOS/toolchain/linux/iphone/bin/clang
+          # 与 install-theos 第 470 行的校验路径一致。
           if ! toolchain_ok; then
             echo
-            echo ">>> 方式A：kabiroberai/swift-toolchain-linux（Theos 官方 install-theos 用的就是它）"
+            echo ">>> 方式A：L1ghtmann/llvm-project iOSToolchain（CI 下 install-theos 用的就是它）"
+            ARCH="$(uname -m)"
+            for f in "iOSToolchain-$ARCH.tar.xz" "iOSToolchain.tar.xz"; do
+              toolchain_ok && break
+              echo "  --- 尝试 $f"
+              install_toolchain_archive "$LIGHT_BASE/$f" || continue
+              # 归档已解到 $THEOS/toolchain/，正常情况下
+              # $THEOS/toolchain/linux/iphone/bin/clang 应当已存在；
+              # 若内部结构与预期不同，install_from_archive 会自己找出来补链。
+              if [ ! -x "$TBIN/clang" ]; then
+                echo "  --- 未在预期位置找到 clang，尝试在 toolchain 下搜索补齐"
+                install_from_archive "$THEOS/toolchain"
+              fi
+            done
+            if toolchain_ok; then echo ">>> 方式A 完整可用"; show_state; fi
+          fi
+
+          # ---------------- 方式B：Swift 版工具链（install-theos 第 437/439 行）----
+          if ! toolchain_ok; then
+            echo
+            echo ">>> 方式B：kabiroberai/swift-toolchain-linux（install-theos 第 437/439 行）"
             ARCH="$(uname -m)"
             for f in "swift-5.8-ubuntu20.04-$ARCH.tar.xz" "swift-5.8-ubuntu20.04.tar.xz"; do
               toolchain_ok && break
               echo "  --- 尝试 $f"
               install_toolchain_archive "$KABI_BASE/$f" \
-                && install_from_archive "$THEOS/toolchain"
-            done
-            if toolchain_ok; then echo ">>> 方式A 完整可用"; show_state; fi
-          fi
-
-          # ---------------- 方式B：Theos 用的 iOS 工具链包 ----------------
-          if ! toolchain_ok; then
-            echo
-            echo ">>> 方式B：L1ghtmann/llvm-project iOSToolchain（install-theos 第 461 行用的）"
-            ARCH="$(uname -m)"
-            for f in "iOSToolchain-$ARCH.tar.xz" "iOSToolchain.tar.xz"; do
-              toolchain_ok && break
-              echo "  --- 尝试 $f"
-              install_toolchain_archive "$LIGHT_BASE/$f" \
                 && install_from_archive "$THEOS/toolchain"
             done
             if toolchain_ok; then echo ">>> 方式B 完整可用"; show_state; fi
@@ -322,35 +349,68 @@ jobs:
 
           sdk_ok && echo ">>> SDK 已由前面步骤装好" || true
 
-          # ---------------- 方式A：Theos 官方 SDK 来源（实测确认）----------------
-          # 探测器读到 install-sdk 第 13 行：
-          #   SDK_FETCH_URL="https://api.github.com/repos/theos/sdks/releases/latest"
-          # 这是 Theos 自己取得 SDK 的正规途径，优先使用。
+          # ---------------- 方式A：Theos 官方 install-sdk（必须带参数！）----------------
+          # install-sdk 已核对源码（60 行）：
+          #   第 26-30 行：if [[ $# -ne 1 ]] 则打印 Usage 并 exit 2
+          #                （我上一次就是因为没给参数，直接 exit 2 挂掉）
+          #   第 45-51 行：参数 "latest" 会挑最新的 iPhoneOS*.sdk；
+          #                也可直接给 "iPhoneOS16.5"
+          #   第 58 行：   自行 curl 并 tar 解到 $THEOS/sdks
+          #   第 54-56 行：若该 SDK 已存在则 exit 5（不算致命）
+          # 它用的地址实测为 https://api.github.com/repos/theos/sdks/releases/latest
           if ! sdk_ok; then
-            echo ">>> 方式A：Theos 官方 SDK（theos/sdks releases，走 GitHub API）"
+            echo ">>> 方式A：$THEOS/bin/install-sdk latest"
             if [ -x "$THEOS/bin/install-sdk" ]; then
-              # 该脚本可能有交互提示；它会自己解压到 $THEOS/sdks
-              printf '\n\n\n\n\n' > /tmp/ans.txt
-              timeout 1800 bash "$THEOS/bin/install-sdk" < /tmp/ans.txt 2>&1 | tail -60
-              echo ">>> install-sdk 退出码: ${PIPESTATUS[0]}"
+              set +e
+              bash "$THEOS/bin/install-sdk" latest
+              rc=$?
+              set -e
+              echo ">>> install-sdk 退出码: $rc（5 = 该 SDK 已存在，属正常）"
             else
               echo "!!! 不存在 $THEOS/bin/install-sdk"
             fi
             ls "$THEOS/sdks" 2>/dev/null | head -20 || true
           fi
 
-          # ---------------- 方式B：git clone theos/sdks ----------------
+          # ---------------- 方式B：直取 releases 里的 SDK 资产 ----------------
+          # 实测 tag 为 master-<sha>，资产名形如 iPhoneOS16.5.sdk.tar.xz。
+          # 这里不写死 sha，改为通过 API 解析出真实下载地址。
           if ! sdk_ok; then
-            echo ">>> 方式B：git clone theos/sdks"
+            echo ">>> 方式B：经 GitHub API 解析并下载 iPhoneOS SDK"
+            mkdir -p "$THEOS/sdks"
+            TMPD="$(mktemp -d)"
+            api="https://api.github.com/repos/theos/sdks/releases/latest"
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 60 "$api" || echo 000)
+            echo "    [HTTP $code] $api"
+            if [ "$code" = "200" ]; then
+              curl -fsSL --max-time 120 -o "$TMPD/meta.json" "$api" || true
+              # 优先 16.5，其次 15.6，再其次任意 iPhoneOS（取版本号最大的）
+              url="$(grep -o 'https://[^"]*iPhoneOS16\.5\.sdk\.tar\.xz' "$TMPD/meta.json" | head -1)"
+              [ -z "$url" ] && url="$(grep -o 'https://[^"]*iPhoneOS15\.6\.sdk\.tar\.xz' "$TMPD/meta.json" | head -1)"
+              [ -z "$url" ] && url="$(grep -o 'https://[^"]*iPhoneOS[0-9.]*\.sdk\.tar\.xz' "$TMPD/meta.json" | sort -V | tail -1)"
+              echo "    SDK 地址: ${url:-未解析到}"
+              if [ -n "$url" ]; then
+                curl -fsSL --retry 2 --max-time 1800 -o "$TMPD/sdk.tar.xz" "$url" \
+                  && tar -xJf "$TMPD/sdk.tar.xz" -C "$THEOS/sdks" \
+                  && echo "    解压完成"
+              fi
+            fi
+            rm -rf "$TMPD"
+            ls "$THEOS/sdks" 2>/dev/null | head -20 || true
+          fi
+
+          # ---------------- 方式C：git clone theos/sdks ----------------
+          if ! sdk_ok; then
+            echo ">>> 方式C：git clone theos/sdks"
             rm -rf "$THEOS/sdks"
             git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks" \
               || echo "!!! 克隆失败"
             ls "$THEOS/sdks" 2>/dev/null | head -20 || true
           fi
 
-          # ---------------- 方式C：下载 master 归档（实测 HTTP 200）----------------
+          # ---------------- 方式D：下载 master 归档（实测 HTTP 200）----------------
           if ! sdk_ok; then
-            echo ">>> 方式C：下载 theos/sdks master 归档"
+            echo ">>> 方式D：下载 theos/sdks master 归档"
             mkdir -p "$THEOS/sdks"
             TMPD="$(mktemp -d)"
             for u in \
