@@ -26,6 +26,15 @@ name: Build ZZMerge deb
 # ===========================================================================
 on:
   workflow_dispatch:
+    inputs:
+      with_bridge:
+        description: "是否编译并装入桥接层（选 false 则只装原版找鸡，用于排查闪退）"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
   push:
     branches: [ main, master ]
 
@@ -60,6 +69,7 @@ jobs:
           echo ">>> ldid:"; "$HOME/.local/bin/ldid" -h 2>&1 | head -2 || true
 
       - name: 克隆 Theos（并打印其安装脚本，便于核实）
+        if: ${{ github.event.inputs.with_bridge != 'false' }}
         run: |
           set -e
           rm -rf "$THEOS"
@@ -92,6 +102,7 @@ jobs:
       #         2) Apple 兼容链接器（ld64/ld64.lld），绝不能是 GNU ld
       # =====================================================================
       - name: 安装编译工具链
+        if: ${{ github.event.inputs.with_bridge != 'false' }}
         run: |
           set -uo pipefail
 
@@ -338,6 +349,7 @@ jobs:
       # iOS SDK
       # =====================================================================
       - name: 安装 iOS SDK
+        if: ${{ github.event.inputs.with_bridge != 'false' }}
         run: |
           set -uo pipefail
 
@@ -458,6 +470,7 @@ jobs:
       #   所以这里必须带上 -target，与 Theos 的实际行为一致。
       # =====================================================================
       - name: 链接自检（最小 dylib，完全对齐 Theos 的调用方式）
+        if: ${{ github.event.inputs.with_bridge != 'false' }}
         run: |
           set -uo pipefail
           TBIN="$THEOS/toolchain/linux/iphone/bin"
@@ -535,14 +548,27 @@ jobs:
       - name: 构建 deb
         run: |
           set -e
-          make clean 2>/dev/null || true
-          make package FINALPACKAGE=1
+          if [ "${{ github.event.inputs.with_bridge }}" = "false" ]; then
+            echo "=============================================================="
+            echo ">>> 本次为【排查模式】：只打包原版找鸡，不含桥接层"
+            echo ">>> 用途：判断闪退是「找鸡自身/与系统冲突」还是「桥接层」引起"
+            echo "=============================================================="
+            # 该模式下 internal-stage:: 依然会执行（会把 vendor 里的找鸡并入
+            # 打包目录），但不编译桥接源码；若 stage 目标缺失则退化为手工组装。
+            make clean 2>/dev/null || true
+            make stage FINALPACKAGE=1 || true
+          else
+            make clean 2>/dev/null || true
+            make package FINALPACKAGE=1
+          fi
+
           echo ">>> Theos 打包目录 $(pwd)/packages 内容:"
           ls -la packages/ 2>/dev/null || echo "  (packages 目录不存在)"
+          echo ">>> .theos/_ 内容（staging 目录）:"
+          find .theos/_ -maxdepth 4 2>/dev/null | head -30 || true
           echo ">>> 全仓库搜索 deb:"
-          find . -name '*.deb' -not -path './theos/*' -exec ls -la {} \;
-          # 把 deb 统一收集到仓库根目录的 dist/，供后续步骤与上传使用，
-          # 避免依赖 Theos 的默认输出目录（它在 _THEOS_PACKAGE_DIR / packages/ 之间可能变化）
+          find . -name '*.deb' -not -path './theos/*' -exec ls -la {} \; || true
+
           mkdir -p dist
           found=0
           for f in packages/*.deb .theos/*.deb *.deb; do
@@ -551,6 +577,19 @@ jobs:
             found=$((found + 1))
             echo ">>> 已收集: $f"
           done
+          if [ "$found" -eq 0 ]; then
+            echo ">>> packages/ 下没有 deb，尝试从 staging 目录手工组装（排查模式）"
+            STAGE_DIR="$(ls -d .theos/_ 2>/dev/null | head -1)"
+            if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR/Library/MobileSubstrate/DynamicLibraries" ]; then
+              echo ">>> staging 内容:"; find "$STAGE_DIR" -type f | head -20
+              mkdir -p dist/pack/DEBIAN
+              cp -R "$STAGE_DIR"/* dist/pack/ 2>/dev/null || true
+              cp control dist/pack/DEBIAN/control
+              ( cd dist && dpkg-deb -b pack "com.hang.zzzj_0.0.1-9_nobridge_iphoneos-arm64.deb" )
+              rm -rf dist/pack
+              found=1
+            fi
+          fi
           if [ "$found" -eq 0 ]; then
             echo "!!! 没有找到任何 deb 产物，构建视为失败"
             exit 1
@@ -583,7 +622,7 @@ jobs:
       - name: 上传 deb
         uses: actions/upload-artifact@v4
         with:
-          name: zzmerge-deb
+          name: zzmerge-deb-${{ github.event.inputs.with_bridge == 'false' && 'NOBRIDGE' || 'ADDON' }}
           # Theos 的 deb 默认生成在 $(THEOS_PROJECT_DIR)/packages/ 下，不在仓库根目录。
           # 早先写成 "*.deb" 只在根目录匹配，因此报
           #   "No files were found with the provided path: *.deb"
