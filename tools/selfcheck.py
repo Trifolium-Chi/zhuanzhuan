@@ -222,6 +222,82 @@ def check_makefile():
     say(OK if "before-package" not in s else WARN,
         "未使用非标准钩子 before-package: %s" % ("before-package" not in s))
 
+    # 关键：不能默认导出 THEOS_PACKAGE_SCHEME，否则 Theos 会因未知 scheme 直接报错
+    bad_scheme = re.findall(r"(?m)^\s*export\s+THEOS_PACKAGE_SCHEME\s*[:?]?=", s)
+    say(OK if not bad_scheme else FAIL,
+        "未默认导出 THEOS_PACKAGE_SCHEME（否则报 scheme does not exist）: %s"
+        % (not bad_scheme))
+    if "roothide" in s:
+        code_lines = [l for l in s.splitlines()
+                      if "roothide" in l and not l.lstrip().startswith("#")]
+        say(OK if not code_lines else FAIL,
+            "roothide 字样只出现在注释中: %s" % (not code_lines))
+
+
+# ---------------------------------------------------------------- 6. CI 工作流
+def check_workflow():
+    print("\n=== 6. GitHub Actions 工作流 ===")
+    p = os.path.join(ROOT, ".github", "workflows", "build.yml")
+    if not os.path.exists(p):
+        say(FAIL, "找不到 .github/workflows/build.yml")
+        return
+    s = read(p)
+    say(OK if "actions/checkout@v4" in s else FAIL, "使用 checkout@v4")
+    say(OK if "theos/theos.git" in s else FAIL, "自动安装 Theos")
+    say(OK if "ldid" in s else FAIL, "自动获取 ldid（给原始 dylib 重签名）")
+    say(OK if "ldid -S" in s else FAIL, "对原始 dylib 执行 ldid -S")
+    say(OK if "dpkg-deb -x" in s else FAIL, "从 vendor_src 解出原始 dylib")
+    say(OK if "make package FINALPACKAGE=1" in s else FAIL, "执行 make package")
+    say(OK if "upload-artifact" in s else FAIL, "上传 deb 产物")
+
+    # ---- iOS SDK 安装必须有多重回退 + 硬校验（第二次构建失败的根因）----
+    say(OK if "get-toolchain.sh" in s else FAIL, "方式A：调用官方 get-toolchain.sh")
+    say(OK if "theos/sdks" in s else FAIL, "方式B：回退克隆 theos/sdks 仓库")
+    say(OK if "sdk_ok" in s else FAIL, "定义 SDK 可用性校验函数 sdk_ok")
+    say(OK if "sdks.tar.gz" in s and "tar -xzf" in s else FAIL,
+        "方式C：从 SDK 归档包手动解出")
+    say(OK if 'grep -qi' in s and 'iPhoneOS' in s else FAIL,
+        "校验 sdks 目录里确实存在 iPhoneOS*.sdk")
+
+    # ---- 编译工具链必须也有回退 + 硬校验（第三次构建失败的根因）----
+    say(OK if "toolchain/linux/iphone" in s else FAIL,
+        "工具链目标目录 toolchain/linux/iphone")
+    say(OK if "toolchain_ok" in s else FAIL, "定义工具链校验函数 toolchain_ok")
+    say(OK if "-x \"$TOOLCHAIN_DIR/bin/clang\"" in s else FAIL,
+        "以 clang 是否可执行作为工具链判定标准")
+    say(OK if "download.swift.org" in s else FAIL,
+        "方式B：下载 Swift 官方工具链（含交叉编译 clang）")
+    say(OK if "CANDIDATES" in s and "for v in $CANDIDATES" in s else FAIL,
+        "候选 Swift 版本轮询（不写死单一版本号）")
+    say(OK if "command -v clang" in s else FAIL,
+        "方式C：系统 clang 兜底（网络受限时仍有机会成功）")
+    say(OK if "apt-get install" in s and "clang lld llvm binutils" in s else FAIL,
+        "apt 安装 clang/lld/llvm/binutils（兜底路径依赖）")
+
+    # ---- 关键：不能再用 "|| true" 把安装失败吞掉 ----
+    m = re.search(r"(?m)^.*get-toolchain\.sh.*\|\|\s*true\s*$", s)
+    say(OK if not m else FAIL,
+        "get-toolchain.sh 未被 '|| true' 静默吞掉失败: %s" % (not m))
+    # 必须会在没有 SDK / 工具链时明确失败退出
+    seg = s[s.find("toolchain_ok"):]
+    say(OK if seg.count("exit 1") >= 2 else FAIL,
+        "工具链与 SDK 校验不通过时都显式 exit 1")
+
+    # 绝不能在工作流里设置 THEOS_PACKAGE_SCHEME
+    env_set = re.findall(r"(?m)^\s*THEOS_PACKAGE_SCHEME\s*:", s)
+    say(OK if not env_set else FAIL,
+        "工作流未设置 THEOS_PACKAGE_SCHEME（这是第一次构建失败的原因）: %s"
+        % (not env_set))
+    say(OK if not re.search(r"(?m)^\s*scheme:\s*$", s) else FAIL,
+        "已移除会误导的 scheme 输入项")
+
+    # 步骤顺序：必须先工具链、后 SDK
+    i_tc = s.find("安装编译工具链")
+    i_sdk = s.find("安装 iOS SDK")
+    say(OK if 0 < i_tc < i_sdk else FAIL,
+        "步骤顺序为先装工具链、再装 SDK（位置 %d < %d）" % (i_tc, i_sdk))
+    say(OK, "工作流行数: %d" % len(s.splitlines()))
+
 
 # ---------------------------------------------------------------- 5. control
 def check_control():
@@ -251,6 +327,7 @@ def main():
     check_vendor()
     check_makefile()
     check_control()
+    check_workflow()
     print("\n" + "=" * 60)
     if problems:
         print("发现 %d 个问题：" % len(problems))
