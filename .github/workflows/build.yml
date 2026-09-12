@@ -439,16 +439,32 @@ jobs:
           fi
 
       # =====================================================================
-      # 真实链接自检：用最小 dylib 验证 clang + 链接器 + SDK 能协同工作。
-      # 新增于第 4 次失败之后 —— 让「链接器不对」在构建业务代码之前就暴露。
+      # 链接自检：用最小 dylib 验证 clang + 链接器 + SDK 能协同工作。
+      #
+      # 【为什么命令要写成这样】—— 已核对 Theos 源码，不是随手写的：
+      #   makefiles/targets/Linux/iphone.mk 第 14-23 行：
+      #     若工具链里没有 armv7-apple-darwin11-ld / arm64-apple-darwin14-ld，
+      #     则 _THEOS_TARGET_USE_CLANG_TARGET_FLAG := TRUE
+      #     （L1ghtmann 工具链正是这种情况：bin 下只有无前缀的 clang/ld）
+      #   makefiles/targets/_common/darwin_tail.mk 第 34-42 行：
+      #     该标志为真时 VERSIONFLAGS := -target $(ARCH)-apple-ios15.0
+      #     否则        VERSIONFLAGS := -miphoneos-version-min=15.0
+      #     _THEOS_TARGET_LDFLAGS := -isysroot "$(SYSROOT)" $(VERSIONFLAGS) \
+      #                              $(LEGACYFLAGS) -multiply_defined suppress
+      #
+      #   第 4 次失败时我只写了 -arch/-miphoneos-version-min，缺 -target，
+      #   于是旧版 clang（clang-11）走了错误的驱动分支，把 GNU 风格的
+      #   --eh-frame-hdr 传给了 ld64，报 "unknown option: --eh-frame-hdr"。
+      #   所以这里必须带上 -target，与 Theos 的实际行为一致。
       # =====================================================================
-      - name: 链接自检（最小 dylib）
+      - name: 链接自检（最小 dylib，完全对齐 Theos 的调用方式）
         run: |
           set -uo pipefail
           TBIN="$THEOS/toolchain/linux/iphone/bin"
           SDK="$(ls -d "$THEOS"/sdks/iPhoneOS*.sdk 2>/dev/null | sort -V | tail -1)"
           echo ">>> SDK: $SDK"
-          echo ">>> ld  -> $(readlink -f "$TBIN/ld" 2>/dev/null || echo 无)"
+          echo ">>> clang -> $(readlink -f "$TBIN/clang" 2>/dev/null || echo 无)"
+          echo ">>> ld    -> $(readlink -f "$TBIN/ld" 2>/dev/null || echo 无)"
 
           TMPD="$(mktemp -d)"
           cat > "$TMPD/t.m" <<'EOF'
@@ -459,14 +475,19 @@ jobs:
           fail=0
           for arch in arm64 arm64e; do
             echo ">>> 链接 $arch"
+            # 与 Theos 的 VERSIONFLAGS 一致：使用 -target 形式
+            VF="-target $arch-apple-ios15.0"
             if "$TBIN/clang" -x objective-c -c "$TMPD/t.m" -o "$TMPD/t-$arch.o" \
-                 -target "$arch-apple-ios15.0" -isysroot "$SDK" -fobjc-arc 2>&1 | tail -5; then
-              if "$TBIN/clang" -dynamiclib -arch "$arch" -isysroot "$SDK" \
-                   -miphoneos-version-min=15.0 -framework Foundation \
-                   "$TMPD/t-$arch.o" -o "$TMPD/t-$arch.dylib" 2>&1 | tail -10; then
-                [ -f "$TMPD/t-$arch.dylib" ] \
-                  && echo "    $arch 链接成功 ($(stat -c%s "$TMPD/t-$arch.dylib") 字节)" \
-                  || { echo "    !!! $arch 未生成产物"; fail=1; }
+                 -isysroot "$SDK" $VF -fobjc-arc 2>&1 | tail -5; then
+              if "$TBIN/clang" -dynamiclib -isysroot "$SDK" $VF \
+                   -multiply_defined suppress \
+                   -framework Foundation \
+                   "$TMPD/t-$arch.o" -o "$TMPD/t-$arch.dylib" 2>&1 | tail -15; then
+                if [ -f "$TMPD/t-$arch.dylib" ]; then
+                  echo "    $arch 链接成功 ($(stat -c%s "$TMPD/t-$arch.dylib") 字节)"
+                else
+                  echo "    !!! $arch 未生成产物"; fail=1
+                fi
               else
                 echo "    !!! $arch 链接失败"; fail=1
               fi
@@ -474,6 +495,14 @@ jobs:
               echo "    !!! $arch 编译失败"; fail=1
             fi
           done
+
+          # 额外的诊断：打印 clang 实际调用的链接器命令行（便于定位）
+          if [ "$fail" != "0" ]; then
+            echo ">>> 诊断：-v 显示 clang 实际如何调用链接器"
+            "$TBIN/clang" -### -dynamiclib -isysroot "$SDK" \
+              -target arm64-apple-ios15.0 -multiply_defined suppress \
+              -framework Foundation "$TMPD/t-arm64.o" -o "$TMPD/x.dylib" 2>&1 | tail -20 || true
+          fi
           rm -rf "$TMPD"
 
           if [ "$fail" = "0" ]; then
