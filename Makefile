@@ -75,30 +75,30 @@ ZZMergeBridge_FRAMEWORKS = UIKit Foundation
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ---------------------------------------------------------------------------
-# 打包含义开关
+# 产物形态开关
 #
-#   BUNDLE_BASE=0（默认，推荐）
-#       只产出「附加插件」：ZZMergeBridge.dylib + .plist
-#       找鸡由你自己保留，本包不碰它。
-#       —— 这是符合需求的形态：把两个功能「加进」找鸡，而不是替换/合并文件。
+#   BUILD_MODE=inject（默认，推荐）
+#       只编译出「可注入的裸 dylib」：ZZMergeBridge.dylib + .plist
+#       用途：TrollFools / TrollStore 直接把 dylib 注入进 App。
+#       此模式下**完全不需要 vendor/**（不碰找鸡、不碰水水），
+#       也不参与 deb 打包，因此少掉一整个环节的出错可能。
 #
-#   BUNDLE_BASE=1
-#       额外把原版 转转找鸡.dylib/.plist 也打进包（一键安装用）。
-#       注意：这条路径会覆盖你原有的找鸡，且一旦找鸡本身出问题会一起崩。
+#   BUILD_MODE=deb
+#       额外把原版 转转找鸡.dylib/.plist 打进 deb（需要 vendor/）。
+#       仅在你确实要走包管理器安装时才用。
 #
-# 用法：  make package FINALPACKAGE=1 BUNDLE_BASE=1
+# 用法：  make package FINALPACKAGE=1 BUILD_MODE=deb
 # ---------------------------------------------------------------------------
-BUNDLE_BASE ?= 0
-export BUNDLE_BASE
+BUILD_MODE ?= inject
+export BUILD_MODE
 
 DYLIB_DEST = $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries
 
+ifeq ($(BUILD_MODE),deb)
 internal-stage::
-	@echo ">>> [ZZMerge] staging 收尾（BUNDLE_BASE=$(BUNDLE_BASE)）"
+	@echo ">>> [ZZMerge] staging 收尾（BUILD_MODE=deb）"
 	@mkdir -p "$(DYLIB_DEST)"
-ifeq ($(BUNDLE_BASE),1)
-	@echo ">>> BUNDLE_BASE=1：把原版「转转找鸡」也并入打包目录"
-	@echo ">>> 注意：这会在安装时覆盖你原有的找鸡"
+	@echo ">>> 把原版「转转找鸡」并入打包目录（注意：安装时会覆盖你原有的找鸡）"
 	@for f in "$(THEOS_PROJECT_DIR)/vendor/转转找鸡.dylib" \
 	          "$(THEOS_PROJECT_DIR)/vendor/转转找鸡.plist"; do \
 		if [ -e "$$f" ]; then \
@@ -108,18 +108,12 @@ ifeq ($(BUNDLE_BASE),1)
 			echo "    !!! 缺少 $$f（需要先解出 vendor/）"; exit 1; \
 		fi; \
 	done
-else
-	@echo ">>> BUNDLE_BASE=0：只出附加插件，不动你原有的找鸡"
-	@echo ">>> 水水同样不进包（桥接层已自行实现其两项功能）"
-endif
-	@echo ">>> [ZZMerge] 打包目录内容："
 	@ls -la "$(DYLIB_DEST)/" 2>/dev/null || true
-	@test -f "$(DYLIB_DEST)/ZZMergeBridge.dylib" || \
-		(echo ">>> [ZZMerge] 错误：桥接 dylib 未生成，编译可能失败"; exit 1)
-	@test -f "$(DYLIB_DEST)/ZZMergeBridge.plist" || \
-		(echo ">>> [ZZMerge] 错误：桥接 plist 未就位"; exit 1)
-	@echo ">>> 最终清单："
-	@ls -1 "$(DYLIB_DEST)/" | grep -Ev '\.(dSYM|txt|log)$$' || true
+else
+internal-stage::
+	@echo ">>> [ZZMerge] BUILD_MODE=inject：只产出可注入的裸 dylib"
+	@echo ">>> 不需要 vendor/，不碰找鸡，也不打包成 deb"
+endif
 
 after-install::
 	install.exec "killall -9 zhuanzhuan 2>/dev/null || true"
