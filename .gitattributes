@@ -1,0 +1,15 @@
+# 统一换行符，避免 CI 里脚本 / Makefile 因 CRLF 报错
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+Makefile text eol=lf
+*.yml  text eol=lf
+*.x    text eol=lf
+control text eol=lf
+
+# 二进制资源不要被转换
+*.deb  binary
+*.dylib binary
+*.png  binary
+*.jpg  binary

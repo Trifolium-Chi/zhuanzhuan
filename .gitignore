@@ -1,0 +1,11 @@
+# Theos 构建产物
+.theos/
+packages/
+obj/
+vendor/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*~
