@@ -132,145 +132,162 @@ jobs:
           echo ">>> [前置] 清理旧的链接器"
           rm -f "$TBIN/ld" "$TBIN/lld" "$TBIN/ld64.lld"
 
-          # ---------------- 方式A：Theos 官方 install-theos ----------------
-          echo
-          echo ">>> 方式A：$THEOS/bin/install-theos（Theos 官方安装脚本）"
-          if [ -x "$THEOS/bin/install-theos" ]; then
-            # 该脚本可能有交互提示，用 timeout 防止卡死；用文件喂 stdin 以保留退出码
-            printf '\n\n\n\n\n' > /tmp/ans.txt
-            timeout 1500 bash "$THEOS/bin/install-theos" < /tmp/ans.txt 2>&1 | tail -80
-            echo ">>> install-theos 退出码: ${PIPESTATUS[0]}"
-          else
-            echo "!!! 不存在 $THEOS/bin/install-theos"
-          fi
-          echo ">>> 方式A 之后 $TBIN:"
-          ls -la "$TBIN" 2>/dev/null | head -30 || echo "  (不存在)"
-          if toolchain_ok; then echo ">>> 方式A 完整可用"; show_state; fi
+          # =====================================================================
+          # 地址来源（全部来自实测，不再靠猜）：
+          #   探测器 probe.yml 的实测结果：
+          #     *.download.swift.org 的 15 种组合 → 全部 404
+          #       （Theos 根本不用这个域名）
+          #     clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz  → 200
+          #     clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz  → 200
+          #     clang+llvm-16.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz  → 200
+          #     系统 /usr/bin/ld 是 GNU ld 2.42（必须避开）
+          #   并且 install-theos 源码（第 437/439/461 行）明确写着 Theos 自己用：
+          #     kabiroberai/swift-toolchain-linux  v2.3.0  swift-5.8-ubuntu20.04[-$ARCH].tar.xz
+          #     L1ghtmann/llvm-project              iOSToolchain[-$ARCH].tar.xz
+          #   所以下面优先用 Theos 自己的地址，再用实测可用的 LLVM 官方包。
+          # =====================================================================
+          KABI_BASE="https://github.com/kabiroberai/swift-toolchain-linux/releases/download/v2.3.0"
+          LIGHT_BASE="https://github.com/L1ghtmann/llvm-project/releases/latest/download"
 
-          # ---------------- 方式B：Theos 的 SDK 安装器（有时会连带装工具链）----
+          # install-toolchain-archive <url> :
+          #   下载并解压到 $THEOS/toolchain/（与 install-theos 第 461 行同样的做法），
+          #   然后打印解出来的目录结构，便于确认工具链落在哪。
+          install_toolchain_archive() {
+            url="$1"
+            TMPD="$(mktemp -d)"
+            if ! try_get "$url" "$TMPD/tc.tar.xz"; then
+              rm -rf "$TMPD"; return 1
+            fi
+            if ! tar -xJf "$TMPD/tc.tar.xz" -C "$THEOS/toolchain/" 2>/dev/null; then
+              echo "    !!! 解压失败（可能不是 .tar.xz）"
+              rm -rf "$TMPD"; return 1
+            fi
+            rm -rf "$TMPD"
+            echo "    >>> 解压后 \$THEOS/toolchain 结构:"
+            find "$THEOS/toolchain" -maxdepth 3 -type d 2>/dev/null | head -20
+            return 0
+          }
+
+          # install-from-archive <root> :
+          #   从已解压的 LLVM/Swift 目录里，把 clang 与 Apple 链接器链接到 $TBIN
+          install_from_archive() {
+            root="$1"
+            echo "    >>> 在 $root 下查找 clang 与 ld64.lld:"
+            c="$(find "$root" \( -name clang -o -name 'clang-*' \) -type f -perm -u+x 2>/dev/null | head -1)"
+            l="$(find "$root" \( -name 'ld64.lld*' -o -name 'ld64*' \) -type f -perm -u+x 2>/dev/null | head -1)"
+            echo "        clang   = ${c:-未找到}"
+            echo "        ld64    = ${l:-未找到}"
+
+            if [ -n "$c" ]; then
+              ln -sfn "$c" "$TBIN/clang"
+              # 同一目录下的 clang++ 一并链上
+              cdir="$(dirname "$c")"
+              [ -x "$cdir/clang++" ] && ln -sfn "$cdir/clang++" "$TBIN/clang++"
+              for t in ar ranlib nm strip objcopy objdump install_name_tool lipo; do
+                if [ -x "$cdir/$t" ]; then ln -sfn "$cdir/$t" "$TBIN/$t"
+                else s="$(command -v "$t" 2>/dev/null || true)"; [ -n "$s" ] && ln -sfn "$s" "$TBIN/$t"; fi
+              done
+            fi
+            if [ -n "$l" ]; then
+              echo "        -> 采用 ld64: $l"
+              ln -sfn "$l" "$TBIN/ld"
+              ln -sfn "$l" "$TBIN/ld64.lld"
+            fi
+
+            # 兜底：LLVM 目录里找 ld64.lld（可能叫 ld64.lld.darwinnew 等）
+            if ! ld_is_apple; then
+              l2="$(find "$root" -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
+              if [ -n "$l2" ]; then
+                echo "        -> 兜底采用 ld64: $l2"
+                ln -sfn "$l2" "$TBIN/ld"; ln -sfn "$l2" "$TBIN/ld64.lld"
+              fi
+            fi
+          }
+
+          # ---------------- 方式A：Theos 自己用的 Swift 工具链地址 ----------------
+          # 这是 install-theos 第 437/439 行明确使用的地址，最贴近 Theos 的期望。
           if ! toolchain_ok; then
             echo
-            echo ">>> 方式B：$THEOS/bin/install-sdk"
-            if [ -x "$THEOS/bin/install-sdk" ]; then
-              printf '\n\n\n\n\n' > /tmp/ans.txt
-              timeout 1500 bash "$THEOS/bin/install-sdk" < /tmp/ans.txt 2>&1 | tail -60
-              echo ">>> install-sdk 退出码: ${PIPESTATUS[0]}"
-            else
-              echo "!!! 不存在 $THEOS/bin/install-sdk"
-            fi
+            echo ">>> 方式A：kabiroberai/swift-toolchain-linux（Theos 官方 install-theos 用的就是它）"
+            ARCH="$(uname -m)"
+            for f in "swift-5.8-ubuntu20.04-$ARCH.tar.xz" "swift-5.8-ubuntu20.04.tar.xz"; do
+              toolchain_ok && break
+              echo "  --- 尝试 $f"
+              install_toolchain_archive "$KABI_BASE/$f" \
+                && install_from_archive "$THEOS/toolchain"
+            done
+            if toolchain_ok; then echo ">>> 方式A 完整可用"; show_state; fi
+          fi
+
+          # ---------------- 方式B：Theos 用的 iOS 工具链包 ----------------
+          if ! toolchain_ok; then
+            echo
+            echo ">>> 方式B：L1ghtmann/llvm-project iOSToolchain（install-theos 第 461 行用的）"
+            ARCH="$(uname -m)"
+            for f in "iOSToolchain-$ARCH.tar.xz" "iOSToolchain.tar.xz"; do
+              toolchain_ok && break
+              echo "  --- 尝试 $f"
+              install_toolchain_archive "$LIGHT_BASE/$f" \
+                && install_from_archive "$THEOS/toolchain"
+            done
             if toolchain_ok; then echo ">>> 方式B 完整可用"; show_state; fi
           fi
 
-          # ---------------- 方式C：Swift 工具链（多候选 URL + 状态码）----
-          # Ubuntu 22.04 命名为 ubuntu22.04；24.04 为 ubuntu24.04。
-          # 具体版本号逐个探测，避免再靠猜。
+          # ---------------- 方式C：LLVM 官方发布包（实测可用的三组）----------------
           if ! toolchain_ok; then
             echo
-            echo ">>> 方式C：Swift 官方工具链（多候选探测）"
-            TMPD="$(mktemp -d)"
-            swift_root=""
-            for tag in ubuntu24.04 ubuntu22.04 ubuntu20.04; do
-              for v in 6.1-RELEASE 6.0.3-RELEASE 6.0.2-RELEASE 6.0-RELEASE \
-                       5.10.1-RELEASE 5.10-RELEASE 5.9.2-RELEASE 5.8.1-RELEASE; do
-                [ -n "$swift_root" ] && break
-                # 两种可能的路径形式都试
-                for url in \
-                  "https://download.swift.org/swift-release/${tag//./}/swift-$v/swift-$v-$tag.tar.gz" \
-                  "https://download.swift.org/swift-$v-release/${tag//./}/swift-$v-$tag.tar.gz"
-                do
-                  [ -n "$swift_root" ] && break
-                  if try_get "$url" "$TMPD/swift.tar.gz"; then
-                    if tar -xzf "$TMPD/swift.tar.gz" -C "$TMPD" 2>/dev/null; then
-                      swift_root="$(find "$TMPD" -maxdepth 1 -type d -name 'swift-*' | head -1)"
-                      echo "    解压到: $swift_root"
-                    fi
-                  fi
-                done
-              done
-              [ -n "$swift_root" ] && break
-            done
-
-            if [ -n "$swift_root" ] && [ -x "$swift_root/usr/bin/clang" ]; then
-              echo ">>> Swift bin 抽样:"
-              ls "$swift_root/usr/bin" | grep -iE 'clang|ld|lipo|install_name' | head -20
-              for t in clang clang++ ar ranlib nm strip; do
-                [ -x "$swift_root/usr/bin/$t" ] && ln -sfn "$swift_root/usr/bin/$t" "$TBIN/$t"
-              done
-              ldsrc="$(find "$swift_root" -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
-              if [ -n "$ldsrc" ]; then
-                echo "    找到 Apple 链接器: $ldsrc"
-                ln -sfn "$ldsrc" "$TBIN/ld"; ln -sfn "$ldsrc" "$TBIN/ld64.lld"
-              else
-                echo "    !!! Swift 包里没有 ld64.lld（需要靠方式D 补）"
+            echo ">>> 方式C：LLVM 官方发布包（实测可用的组合）"
+            # 注意：每版可用的 os 后缀不同（实测结果），所以按 (版本,后缀) 成对尝试
+            for pair in \
+              "18.1.8 ubuntu-18.04" \
+              "17.0.6 ubuntu-22.04" \
+              "16.0.6 ubuntu-22.04"
+            do
+              toolchain_ok && break
+              set -- $pair
+              ver="$1"; os="$2"
+              url="https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/clang+llvm-$ver-x86_64-linux-gnu-$os.tar.xz"
+              echo "  --- 尝试 $ver / $os"
+              TMPD="$(mktemp -d)"
+              if try_get "$url" "$TMPD/llvm.tar.xz"; then
+                if tar -xJf "$TMPD/llvm.tar.xz" -C "$TMPD" 2>/dev/null; then
+                  root="$(find "$TMPD" -maxdepth 2 -type d -name bin | head -1)"
+                  root="$(dirname "$root")"
+                  echo "    解压到: $root"
+                  install_from_archive "$root"
+                else
+                  echo "    !!! 解压失败"
+                fi
               fi
-            else
-              echo "!!! 方式C 未拿到 Swift 工具链"
-            fi
-            rm -rf "$TMPD"
+              rm -rf "$TMPD"
+            done
             if toolchain_ok; then echo ">>> 方式C 完整可用"; show_state; fi
           fi
 
-          # ---------------- 方式D：LLVM 官方包（补 clang 和/或 ld64.lld）----
-          # 官方发布包文件名形如 clang+llvm-<ver>-x86_64-linux-gnu-ubuntu-<os>.tar.xz
-          # 注意：文件名里**不含** git tag 的 "llvmorg-" 前缀（这是我上轮的错误）。
-          # 这里穷举几种已知命名形式，并打印每个候选的 HTTP 状态码。
+          # ---------------- 方式D：Theos 官方 install-theos（最后手段）----------------
+          # 放在最后：它可能尝试完整安装 Theos 本身（含交互提示），耗时且可能改动环境。
           if ! toolchain_ok; then
             echo
-            echo ">>> 方式D：LLVM 官方发布包（多候选探测）"
-            TMPD="$(mktemp -d)"
-            llvm_root=""
-            for ver in 18.1.8 17.0.6 16.0.6 15.0.7; do
-              [ -n "$llvm_root" ] && break
-              for os in ubuntu-18.04 ubuntu-20.04 ubuntu-22.04 ubuntu-16.04; do
-                [ -n "$llvm_root" ] && break
-                url="https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/clang+llvm-$ver-x86_64-linux-gnu-$os.tar.xz"
-                if try_get "$url" "$TMPD/llvm.tar.xz"; then
-                  if tar -xJf "$TMPD/llvm.tar.xz" -C "$TMPD" 2>/dev/null; then
-                    llvm_root="$(find "$TMPD" -maxdepth 2 -type d -name bin | head -1)"
-                    llvm_root="$(dirname "$llvm_root")"
-                    echo "    解压到: $llvm_root"
-                  fi
-                fi
-              done
-            done
-
-            if [ -n "$llvm_root" ] && [ -x "$llvm_root/bin/clang" ]; then
-              echo ">>> LLVM bin 抽样:"
-              ls "$llvm_root/bin" | grep -iE 'clang|ld|lipo|install_name|^ar$|ranlib' | head -20
-              # clang 只在还没有的时候才补
-              if [ ! -x "$TBIN/clang" ]; then
-                for t in clang clang++ ar ranlib nm strip objcopy objdump \
-                         install_name_tool lipo; do
-                  if [ -x "$llvm_root/bin/$t" ]; then
-                    ln -sfn "$llvm_root/bin/$t" "$TBIN/$t"
-                  else
-                    s="$(command -v "$t" 2>/dev/null || true)"
-                    [ -n "$s" ] && ln -sfn "$s" "$TBIN/$t"
-                  fi
-                done
-              fi
-              # 链接器：只接受 ld64 系列
-              if ! ld_is_apple; then
-                ldsrc=""
-                for cand in "$llvm_root/bin/ld64.lld" \
-                            "$llvm_root/bin/ld64.lld.darwinnew" \
-                            "$llvm_root/bin/ld.lld"; do
-                  [ -x "$cand" ] && { ldsrc="$cand"; break; }
-                done
-                if [ -n "$ldsrc" ]; then
-                  echo ">>> 链接器来源: $ldsrc"
-                  ln -sfn "$ldsrc" "$TBIN/ld"; ln -sfn "$ldsrc" "$TBIN/ld64.lld"
-                else
-                  echo "!!! LLVM 包里没找到 ld64.lld"
-                fi
-              fi
-              ls -la "$TBIN" | head -30
+            echo ">>> 方式D：$THEOS/bin/install-theos"
+            if [ -x "$THEOS/bin/install-theos" ]; then
+              printf '\n\n\n\n\n' > /tmp/ans.txt
+              timeout 1500 bash "$THEOS/bin/install-theos" < /tmp/ans.txt 2>&1 | tail -80
+              echo ">>> install-theos 退出码: ${PIPESTATUS[0]}"
+              # 它把工具链解到 $THEOS/toolchain/，找出实际的 clang 位置
+              echo ">>> \$THEOS/toolchain 结构:"
+              find "$THEOS/toolchain" -maxdepth 4 -type d 2>/dev/null | head -20
+              real_clang="$(find "$THEOS/toolchain" -name clang -type f -perm -u+x 2>/dev/null | head -1)"
+              real_ld64="$(find "$THEOS/toolchain" -name 'ld64.lld*' -type f 2>/dev/null | head -1)"
+              echo "    找到 clang: ${real_clang:-无}"
+              echo "    找到 ld64 : ${real_ld64:-无}"
+              [ -n "$real_clang" ] && ln -sfn "$real_clang" "$TBIN/clang"
+              [ -n "$real_ld64" ] && { ln -sfn "$real_ld64" "$TBIN/ld"; ln -sfn "$real_ld64" "$TBIN/ld64.lld"; }
             else
-              echo "!!! 方式D 未拿到 LLVM 包"
+              echo "!!! 不存在 $THEOS/bin/install-theos"
             fi
-            rm -rf "$TMPD"
             if toolchain_ok; then echo ">>> 方式D 完整可用"; show_state; fi
           fi
+
 
           # ---------------- 硬校验 ----------------
           echo
@@ -305,24 +322,35 @@ jobs:
 
           sdk_ok && echo ">>> SDK 已由前面步骤装好" || true
 
+          # ---------------- 方式A：Theos 官方 SDK 来源（实测确认）----------------
+          # 探测器读到 install-sdk 第 13 行：
+          #   SDK_FETCH_URL="https://api.github.com/repos/theos/sdks/releases/latest"
+          # 这是 Theos 自己取得 SDK 的正规途径，优先使用。
           if ! sdk_ok; then
-            echo ">>> 方式A：git clone theos/sdks"
+            echo ">>> 方式A：Theos 官方 SDK（theos/sdks releases，走 GitHub API）"
+            if [ -x "$THEOS/bin/install-sdk" ]; then
+              # 该脚本可能有交互提示；它会自己解压到 $THEOS/sdks
+              printf '\n\n\n\n\n' > /tmp/ans.txt
+              timeout 1800 bash "$THEOS/bin/install-sdk" < /tmp/ans.txt 2>&1 | tail -60
+              echo ">>> install-sdk 退出码: ${PIPESTATUS[0]}"
+            else
+              echo "!!! 不存在 $THEOS/bin/install-sdk"
+            fi
+            ls "$THEOS/sdks" 2>/dev/null | head -20 || true
+          fi
+
+          # ---------------- 方式B：git clone theos/sdks ----------------
+          if ! sdk_ok; then
+            echo ">>> 方式B：git clone theos/sdks"
             rm -rf "$THEOS/sdks"
             git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks" \
               || echo "!!! 克隆失败"
             ls "$THEOS/sdks" 2>/dev/null | head -20 || true
           fi
 
+          # ---------------- 方式C：下载 master 归档（实测 HTTP 200）----------------
           if ! sdk_ok; then
-            echo ">>> 方式B：$THEOS/bin/install-sdk"
-            if [ -x "$THEOS/bin/install-sdk" ]; then
-              printf '\n\n\n\n\n' > /tmp/ans.txt
-              timeout 1500 bash "$THEOS/bin/install-sdk" < /tmp/ans.txt 2>&1 | tail -60
-            fi
-          fi
-
-          if ! sdk_ok; then
-            echo ">>> 方式C：下载 theos/sdks 归档"
+            echo ">>> 方式C：下载 theos/sdks master 归档"
             mkdir -p "$THEOS/sdks"
             TMPD="$(mktemp -d)"
             for u in \
