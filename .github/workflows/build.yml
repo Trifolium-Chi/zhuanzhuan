@@ -46,19 +46,107 @@ jobs:
           chmod +x "$HOME/.local/bin/ldid"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: 安装 Theos
+      - name: 安装 Theos 与 iOS SDK（三级回退，失败即报错）
         run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          "$THEOS/bin/get-toolchain.sh" 2>/dev/null || true
-          if [ ! -d "$THEOS/sdks" ] || [ -z "$(ls -A "$THEOS/sdks" 2>/dev/null)" ]; then
-            echo ">>> 工具链脚本未就绪，回退到 theos/sdks 仓库"
-            git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
+          set -uo pipefail   # 注意：这里先不用 -e，我们要自己控制每一步的失败处理
+
+          echo "=============================================================="
+          echo ">>> 1. 克隆 Theos"
+          echo "=============================================================="
+          rm -rf "$THEOS"
+          if ! git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"; then
+            echo "!!! 克隆 theos/theos 失败"
+            exit 1
           fi
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          # 浅克隆有时拿不全递归子模块，补一次（失败不算致命，后面还有回退）
+          git -C "$THEOS" submodule update --init --recursive --recommend-shallow \
+            || echo "!!! 子模块补充失败（继续）"
+          ls "$THEOS"
           echo ">>> 当前 Theos 支持的 package scheme（用于核对）:"
           ls "$THEOS/makefiles/package" 2>/dev/null || echo "  (无 package 目录)"
-          echo ">>> SDK:"
-          ls "$THEOS/sdks" | head
+
+          sdk_ok() {
+            [ -d "$THEOS/sdks" ] && \
+            [ -n "$(ls -A "$THEOS/sdks" 2>/dev/null)" ] && \
+            ls "$THEOS/sdks" | grep -qi '^iPhoneOS.*\.sdk$'
+          }
+
+          echo
+          echo "=============================================================="
+          echo ">>> 2. 方式A：官方脚本 theos/bin/get-toolchain.sh"
+          echo "=============================================================="
+          if [ -x "$THEOS/bin/get-toolchain.sh" ]; then
+            "$THEOS/bin/get-toolchain.sh" || echo "!!! get-toolchain.sh 返回非 0"
+          else
+            echo "!!! 找不到 get-toolchain.sh"
+          fi
+          echo ">>> 方式A 之后的 SDK 目录："
+          ls -la "$THEOS/sdks" 2>/dev/null || echo "  (sdks 目录不存在)"
+
+          if ! sdk_ok; then
+            echo
+            echo "=============================================================="
+            echo ">>> 3. 方式B：直接克隆 theos/sdks 仓库"
+            echo "=============================================================="
+            rm -rf "$THEOS/sdks"
+            git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks" \
+              || echo "!!! 克隆 theos/sdks 失败"
+            ls -la "$THEOS/sdks" 2>/dev/null | head -30 || true
+          fi
+
+          if ! sdk_ok; then
+            echo
+            echo "=============================================================="
+            echo ">>> 4. 方式C：从 SDK 归档包手动解出"
+            echo "=============================================================="
+            mkdir -p "$THEOS/sdks"
+            TMPD="$(mktemp -d)"
+            got=0
+            for u in \
+              "https://github.com/theos/sdks/archive/refs/heads/master.tar.gz" \
+              "https://github.com/theos/sdks/archive/refs/heads/main.tar.gz" \
+              "https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master"
+            do
+              echo ">>> 尝试 $u"
+              if curl -fsSL --retry 3 --max-time 300 -o "$TMPD/sdks.tar.gz" "$u"; then
+                if tar -xzf "$TMPD/sdks.tar.gz" -C "$TMPD"; then
+                  find "$TMPD" -maxdepth 3 -name '*.sdk' -type d \
+                    -exec cp -R {} "$THEOS/sdks/" \; && got=1
+                  break
+                fi
+              fi
+            done
+            rm -rf "$TMPD"
+            if [ "$got" = "1" ]; then
+              echo ">>> 方式C 成功"
+            else
+              echo "!!! 方式C 也失败"
+            fi
+          fi
+
+          # ---- 硬校验 ----
+          echo
+          echo "=============================================================="
+          echo ">>> 5. 校验"
+          echo "=============================================================="
+          echo "THEOS=$THEOS"
+          echo "--- \$THEOS/sdks 内容 ---"
+          ls -la "$THEOS/sdks" 2>/dev/null || echo "  (不存在)"
+          echo "--- 工具链 ---"
+          ls -la "$THEOS/toolchain" 2>/dev/null || echo "  (不存在)"
+
+          if sdk_ok; then
+            echo "SDK 校验通过"
+          else
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "!!! 仍然没有可用 SDK，构建必然失败。"
+            echo "!!! 可能原因：GitHub 到 theos 仓库网络受限 / 配额 / 仓库改名。"
+            echo "!!! 请把上面完整输出发给我。"
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            exit 1
+          fi
+
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
       - name: 从原始 deb 中取出两个 dylib 与 plist
         run: |
