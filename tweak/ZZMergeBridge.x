@@ -114,24 +114,31 @@ static NSInteger ZZVerCmp(NSString *a, NSString *b) {
 #pragma mark - 筛选判定
 
 static BOOL ZZPassesRegionVersion(NSDictionary *item) {
-    if (!item) return NO;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSString *region = [ud stringForKey:kRegionKey];
-    NSString *vmin   = [ud stringForKey:kVerMinKey];
-    NSString *vmax   = [ud stringForKey:kVerMaxKey];
+    if (![item isKindOfClass:[NSDictionary class]]) return NO;
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSString *region = [ud stringForKey:kRegionKey];
+        NSString *vmin   = [ud stringForKey:kVerMinKey];
+        NSString *vmax   = [ud stringForKey:kVerMaxKey];
 
-    if (region.length && ![region isEqualToString:@"不限"]) {
-        NSMutableString *hay = [NSMutableString string];
-        for (NSString *k in @[ @"title", @"appearance", @"storage", @"charge", @"sysVer" ]) {
-            if (item[k]) [hay appendFormat:@" %@", item[k]];
+        if (region.length && ![region isEqualToString:@"不限"]) {
+            NSMutableString *hay = [NSMutableString string];
+            for (NSString *k in @[ @"title", @"appearance", @"storage", @"charge", @"sysVer" ]) {
+                id v = item[k];
+                if ([v isKindOfClass:[NSString class]]) [hay appendFormat:@" %@", v];
+                else if ([v isKindOfClass:[NSNumber class]]) [hay appendFormat:@" %@", v];
+            }
+            if (![hay containsString:region]) return NO;
         }
-        if (![hay containsString:region]) return NO;
-    }
 
-    NSString *sv = item[@"sysVer"];
-    if (sv.length) {
-        if (vmin.length && ZZVerCmp(sv, vmin) < 0) return NO;
-        if (vmax.length && ZZVerCmp(sv, vmax) > 0) return NO;
+        id svObj = item[@"sysVer"];
+        if ([svObj isKindOfClass:[NSString class]] && [(NSString *)svObj length]) {
+            NSString *sv = (NSString *)svObj;
+            if (vmin.length && ZZVerCmp(sv, vmin) < 0) return NO;
+            if (vmax.length && ZZVerCmp(sv, vmax) > 0) return NO;
+        }
+    } @catch (NSException *e) {
+        ZMLOG(@"ZZPassesRegionVersion 抛异常，按通过处理: %@", e.reason);
     }
     return YES;
 }
@@ -184,9 +191,23 @@ static NSString *ZZRegionVersionTitle(void) {
 
 - (instancetype)init {
     if ((self = [super init])) {
-        NSArray *raw = [[NSUserDefaults standardUserDefaults] arrayForKey:kFavKey];
-        _cache = [raw isKindOfClass:[NSArray class]] ? [raw mutableCopy]
-                                                     : [NSMutableArray array];
+        _cache = [NSMutableArray array];
+        @try {
+            NSArray *raw = [[NSUserDefaults standardUserDefaults] arrayForKey:kFavKey];
+            if ([raw isKindOfClass:[NSArray class]]) {
+                for (id d in raw) {
+                    // 防御：只保留字典项，避免旧数据/脏数据导致后续取下标崩
+                    if ([d isKindOfClass:[NSDictionary class]]) {
+                        [_cache addObject:d];
+                    } else {
+                        ZMLOG(@"收藏数据中跳过非字典项: %@", NSStringFromClass([d class]));
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            ZMLOG(@"读取收藏数据抛异常，按空处理: %@", e.reason);
+            _cache = [NSMutableArray array];
+        }
     }
     return self;
 }
@@ -278,18 +299,83 @@ static void ZZToast(UIView *host, NSString *text) {
     }];
 }
 
-static UIViewController *ZZTopViewController(void) {
-    UIWindow *key = nil;
+// 取当前可用于 present 的控制器。
+//
+// 说明：早期版本只走 connectedScenes/windows 找 keyWindow，在 iOS 15.4 上
+// 若 keyWindow 为 nil，rootViewController 也会是 nil，后续 present 就成了
+// 对一个 nil 控制器操作 —— 虽然给 nil 发消息不会崩，但会导致"点了没反应"。
+// 这里改成多路兜底：keyWindow → 任意可见 window → 已存在窗口的 root。
+static UIWindow *ZZActiveWindow(void) {
+    // 1) 优先 keyWindow
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-            if (w.isKeyWindow) { key = w; break; }
+            if (w.isKeyWindow) return w;
         }
-        if (key) break;
     }
+    // 2) 退而求其次：属于 UIWindowScene 的第一个 window
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        if (ws.windows.count > 0) return ws.windows.firstObject;
+    }
+    // 3) 最后兜底：老的 windows 数组（iOS 15 仍可用）
+    UIApplication *app = UIApplication.sharedApplication;
+    if ([app respondsToSelector:@selector(windows)]) {
+        NSArray *wins = [app performSelector:@selector(windows)];
+        if ([wins isKindOfClass:[NSArray class]] && wins.count) {
+            for (UIWindow *w in wins) {
+                if (w.isKeyWindow) return w;
+            }
+            return wins.firstObject;
+        }
+    }
+    return nil;
+}
+
+static UIViewController *ZZTopViewController(void) {
+    UIWindow *key = ZZActiveWindow();
     UIViewController *vc = key.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    // 逐层下钻到最顶层的已呈现控制器
+    NSUInteger guard = 0;
+    while (vc.presentedViewController && guard++ < 16) {
+        vc = vc.presentedViewController;
+    }
     return vc;
+}
+
+/// 安全地呈现一个控制器：任何异常都不会传染给宿主 App
+static void ZZPresentVC(UIViewController *vc, NSString *tag) {
+    if (!vc) { ZMLOG(@"[%@] 待呈现控制器为 nil", tag); return; }
+    @try {
+        UIViewController *host = ZZTopViewController();
+        if (!host) {
+            ZMLOG(@"[%@] 找不到可用的宿主控制器，放弃呈现", tag);
+            return;
+        }
+        if (host.isBeingDismissed || host.isBeingPresented) {
+            // 正在转场，延后一点再试
+            ZMLOG(@"[%@] 宿主正在转场，延后重试", tag);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *h2 = ZZTopViewController();
+                if (h2 && !h2.isBeingDismissed && !h2.isBeingPresented) {
+                    @try {
+                        [h2 presentViewController:vc animated:YES completion:nil];
+                    } @catch (NSException *e) {
+                        ZMLOG(@"[%@] 延后呈现仍失败: %@", tag, e.reason);
+                    }
+                }
+            });
+            return;
+        }
+        ZMLOG(@"[%@] 宿主=%@ 呈现中…", tag, NSStringFromClass(host.class));
+        [host presentViewController:vc animated:YES completion:^{
+            ZMLOG(@"[%@] 呈现完成", tag);
+        }];
+    } @catch (NSException *e) {
+        ZMLOG(@"[%@] 呈现抛异常: %@ (%@)", tag, e.reason, e.name);
+    }
 }
 
 #pragma mark - ZZFloat 前置声明（供后续辅助函数使用）
@@ -461,8 +547,19 @@ static UIViewController *ZZTopViewController(void) {
 
 - (NSArray<NSDictionary *> *)rows {
     NSMutableArray *out = [NSMutableArray array];
-    for (NSDictionary *d in [ZZFavStore shared].all) {
-        if (ZZPassesRegionVersion(d)) [out addObject:d];
+    @try {
+        NSArray *all = [ZZFavStore shared].all;
+        ZMLOG(@"收藏总数: %lu", (unsigned long)all.count);
+        for (id d in all) {
+            // 防御：defaults 里若混入非字典对象，直接跳过而不是崩
+            if (![d isKindOfClass:[NSDictionary class]]) {
+                ZMLOG(@"跳过非字典条目: %@", NSStringFromClass([d class]));
+                continue;
+            }
+            if (ZZPassesRegionVersion((NSDictionary *)d)) [out addObject:d];
+        }
+    } @catch (NSException *e) {
+        ZMLOG(@"rows 构建抛异常，返回空列表: %@", e.reason);
     }
     return out;
 }
@@ -821,19 +918,33 @@ static NSArray<NSDictionary *> *ZZFilteredSnapshots(id zzfloat) {
 }
 
 - (void)zzOpenRegionVersion:(id)sender {
-    ZZRegionVersionVC *vc = [ZZRegionVersionVC new];
-    UINavigationController *nav =
-        [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [ZZTopViewController() presentViewController:nav animated:YES completion:nil];
+    ZMLOG(@"点击「版本地区」按钮");
+    @try {
+        ZZRegionVersionVC *vc = [ZZRegionVersionVC new];
+        UINavigationController *nav =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        ZZPresentVC(nav, @"版本地区");
+    } @catch (NSException *e) {
+        ZMLOG(@"zzOpenRegionVersion 抛异常: %@", e.reason);
+        ZZToast(sender, @"打开失败，请重试");
+    }
 }
 
 - (void)zzOpenFavorites:(id)sender {
-    ZZFavoritesVC *vc = [ZZFavoritesVC new];
-    UINavigationController *nav =
-        [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [ZZTopViewController() presentViewController:nav animated:YES completion:nil];
+    ZMLOG(@"点击「我的收藏」按钮");
+    @try {
+        ZZFavoritesVC *vc = [ZZFavoritesVC new];
+        ZMLOG(@"ZZFavoritesVC 已创建: %@", vc);
+        UINavigationController *nav =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        ZMLOG(@"UINavigationController 已创建: %@", nav);
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        ZZPresentVC(nav, @"我的收藏");
+    } @catch (NSException *e) {
+        ZMLOG(@"zzOpenFavorites 抛异常: %@ (%@)", e.reason, e.name);
+        ZZToast(sender, @"打开收藏失败，请重试");
+    }
 }
 
 // ---- 筛选变化后刷新 ----
