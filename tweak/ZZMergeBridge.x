@@ -608,6 +608,74 @@ static NSDictionary *ZZSnapshotForCell(UITableViewCell *cell) {
     return objc_getAssociatedObject(cell, ZZKey("zzFavSnapshot"));
 }
 
+#pragma mark - 安全调用找鸡的私有工厂方法
+//
+// 【为什么必须这样写】
+// 之前是这么调的：
+//     ((id (*)(id, SEL, CGFloat, CGFloat, CGFloat, SEL))objc_msgSend)(self, sel, x, y, w, s)
+// 这是「猜签名」并强转 objc_msgSend —— 一旦找鸡那个方法的真实签名与此不符
+// （参数个数/类型不同，或返回值不是对象），这次调用就会破坏调用约定直接崩溃。
+// 因此改为：先取 methodSignature 校验参数个数与返回值类型，再用 NSInvocation 调用；
+// 任何不符就返回 nil，由调用方退回自建按钮。宁可样式差一点也不能崩。
+static UIButton *ZZTryMakeFilterButton_Safe(id target, CGFloat x, CGFloat y,
+                                           CGFloat w, SEL action) {
+    if (!target || !action) return nil;
+    SEL factory = NSSelectorFromString(@"filterButton:x:y:w:sel:");
+    if (![target respondsToSelector:factory]) {
+        ZMLOG(@"找鸡没有 filterButton:x:y:w:sel:，改用自建按钮");
+        return nil;
+    }
+    @try {
+        NSMethodSignature *sig = [target methodSignatureForSelector:factory];
+        if (!sig) return nil;
+        // 期望: self, _cmd, CGFloat, CGFloat, CGFloat, SEL
+        if (sig.numberOfArguments != 6) {
+            ZMLOG(@"filterButton: 参数个数为 %lu（期望 6），放弃复用",
+                  (unsigned long)sig.numberOfArguments);
+            return nil;
+        }
+        const char *ret = sig.methodReturnType;
+        if (!ret || (ret[0] != '@' && ret[0] != '#')) {
+            ZMLOG(@"filterButton: 返回类型为 %s（期望对象），放弃复用", ret ? ret : "?");
+            return nil;
+        }
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.target = target;
+        inv.selector = factory;
+        [inv setArgument:&x atIndex:2];
+        [inv setArgument:&y atIndex:3];
+        [inv setArgument:&w atIndex:4];
+        [inv setArgument:&action atIndex:5];
+        [inv invoke];
+        __unsafe_unretained id result = nil;
+        [inv getReturnValue:&result];
+        if ([result isKindOfClass:[UIButton class]]) return (UIButton *)result;
+        ZMLOG(@"filterButton: 返回的不是 UIButton，改用自建按钮");
+    } @catch (NSException *e) {
+        ZMLOG(@"调用 filterButton: 抛异常：%@", e.reason);
+    }
+    return nil;
+}
+
+/// 自建一个与找鸡风格接近的按钮（工厂方法不可用时的退路）
+static UIButton *ZZMakePlainButton(CGRect frame, NSString *title, id target, SEL action) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = frame;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
+    b.layer.cornerRadius = 6;
+    b.clipsToBounds = YES;
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.6;
+    b.titleLabel.numberOfLines = 2;
+    b.titleLabel.textAlignment = NSTextAlignmentCenter;
+    if (target && action) [b addTarget:target action:action
+                      forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
 #pragma mark - 过滤快照（行数与 cell 绑定共用同一份数据）
 
 /// 当前筛选条件的签名字符串，用于判断缓存是否失效
@@ -657,114 +725,99 @@ static NSArray<NSDictionary *> *ZZFilteredSnapshots(id zzfloat) {
 - (void)buildPanel {
     %orig;
 
-    ZMLOG(@"buildPanel 触发，开始注入");
+    // 整段注入逻辑都放在 @try 里：无论出现什么意外，都不影响找鸡本身。
+    @try {
+        ZMLOG(@"buildPanel 触发，开始注入");
 
-    UIView *panel = ZZSafeGet(self, @"panel");
-    if (![panel isKindOfClass:[UIView class]]) {
-        id win = ZZSafeGet(self, @"win");
-        panel = ZZSafeGet(win, @"panel");
-    }
-    if (![panel isKindOfClass:[UIView class]]) {
-        ZMLOG(@"找不到 panel，跳过注入");
-        return;
-    }
-
-    // 找鸡的 5 个筛选按钮，按 ivar 名收集
-    NSMutableArray<UIButton *> *btns = [NSMutableArray array];
-    for (NSString *key in @[ @"modelBtn", @"batteryBtn", @"verBtn",
-                             @"conditionBtn", @"storageBtn" ]) {
-        id b = ZZSafeGet(self, key);
-        if ([b isKindOfClass:[UIButton class]]) [btns addObject:b];
-    }
-    if (btns.count < 2) {
-        ZMLOG(@"筛选按钮不足(%lu)，跳过", (unsigned long)btns.count);
-        return;
-    }
-    [btns sortUsingComparator:^NSComparisonResult(UIButton *a, UIButton *b) {
-        return a.frame.origin.x < b.frame.origin.x ? NSOrderedAscending
-                                                   : NSOrderedDescending;
-    }];
-
-    CGFloat step = btns[1].frame.origin.x - btns[0].frame.origin.x;
-    if (step <= 0) step = panel.bounds.size.width / 6.0;
-    CGFloat y = btns[0].frame.origin.y;
-    CGFloat h = btns[0].frame.size.height;
-    CGFloat w = btns[0].frame.size.width > 0 ? btns[0].frame.size.width
-                                             : MAX(58.0, step - 6.0);
-
-    // 插入点 = 「成色」右侧一格
-    UIButton *conditionBtn = ZZSafeGet(self, @"conditionBtn");
-    CGFloat insertX = [conditionBtn isKindOfClass:[UIButton class]]
-                          ? conditionBtn.frame.origin.x + step
-                          : btns.lastObject.frame.origin.x + step;
-
-    // 把插入点及其右侧的按钮整体右移一格，腾出位置
-    for (UIButton *b in btns) {
-        if (b.frame.origin.x >= insertX - 1.0) {
-            CGRect f = b.frame;
-            f.origin.x += step;
-            b.frame = f;
+        UIView *panel = ZZSafeGet(self, @"panel");
+        if (![panel isKindOfClass:[UIView class]]) {
+            id win = ZZSafeGet(self, @"win");
+            panel = ZZSafeGet(win, @"panel");
         }
-    }
+        if (![panel isKindOfClass:[UIView class]]) {
+            ZMLOG(@"找不到 panel，跳过注入");
+            return;
+        }
 
-    // 优先复用找鸡自己的工厂方法，保证样式一致
-    UIButton *rvBtn = nil;
-    SEL factory = NSSelectorFromString(@"filterButton:x:y:w:sel:");
-    if ([self respondsToSelector:factory]) {
-        rvBtn = ((id (*)(id, SEL, CGFloat, CGFloat, CGFloat, SEL))objc_msgSend)(
-            self, factory, insertX, y, w, @selector(zzOpenRegionVersion:));
-    }
-    if ([rvBtn isKindOfClass:[UIButton class]]) {
-        [rvBtn addTarget:self
-                  action:@selector(zzOpenRegionVersion:)
-        forControlEvents:UIControlEventTouchUpInside];
-    } else {
-        rvBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        rvBtn.frame = CGRectMake(insertX, y, w, h > 0 ? h : 32.0);
-        rvBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        [rvBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        rvBtn.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
-        rvBtn.layer.cornerRadius = 6;
-        rvBtn.clipsToBounds = YES;
-        [rvBtn addTarget:self
-                  action:@selector(zzOpenRegionVersion:)
-        forControlEvents:UIControlEventTouchUpInside];
-    }
-    [rvBtn setTitle:ZZRegionVersionTitle() forState:UIControlStateNormal];
+        // 找鸡的 5 个筛选按钮，按 ivar 名收集
+        NSMutableArray<UIButton *> *btns = [NSMutableArray array];
+        for (NSString *key in @[ @"modelBtn", @"batteryBtn", @"verBtn",
+                                 @"conditionBtn", @"storageBtn" ]) {
+            id b = ZZSafeGet(self, key);
+            if ([b isKindOfClass:[UIButton class]]) [btns addObject:b];
+        }
+        if (btns.count < 2) {
+            ZMLOG(@"筛选按钮不足(%lu)，跳过注入", (unsigned long)btns.count);
+            return;
+        }
+        [btns sortUsingComparator:^NSComparisonResult(UIButton *a, UIButton *b) {
+            return a.frame.origin.x < b.frame.origin.x ? NSOrderedAscending
+                                                       : NSOrderedDescending;
+        }];
 
-    // 短标题时缩放字号，避免「15.0~17.2 北京」被截断
-    rvBtn.titleLabel.adjustsFontSizeToFitWidth = YES;
-    rvBtn.titleLabel.minimumScaleFactor = 0.6;
-    rvBtn.titleLabel.numberOfLines = 2;
-    rvBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
+        CGFloat step = btns[1].frame.origin.x - btns[0].frame.origin.x;
+        if (step <= 0) step = panel.bounds.size.width / 6.0;
+        CGFloat y = btns[0].frame.origin.y;
+        CGFloat h = btns[0].frame.size.height;
+        CGFloat w = btns[0].frame.size.width > 0 ? btns[0].frame.size.width
+                                                 : MAX(58.0, step - 6.0);
 
-    [panel addSubview:rvBtn];
-    objc_setAssociatedObject(self, ZZKey("zzRVButton"), rvBtn,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    ZMLOG(@"「版本地区」按钮插入完成 x=%.1f y=%.1f w=%.1f step=%.1f",
-          insertX, y, w, step);
+        // 插入点 = 「成色」右侧一格
+        UIButton *conditionBtn = ZZSafeGet(self, @"conditionBtn");
+        CGFloat insertX = [conditionBtn isKindOfClass:[UIButton class]]
+                              ? conditionBtn.frame.origin.x + step
+                              : btns.lastObject.frame.origin.x + step;
 
-    // ---- 「我的收藏」入口：面板右上角 ----
-    UILabel *titleLabel = ZZSafeGet(self, @"titleLabel");
-    UIButton *favBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [favBtn setTitle:@"我的收藏" forState:UIControlStateNormal];
-    favBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [favBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    CGFloat tw = 76.0, th = 30.0;
-    if ([titleLabel isKindOfClass:[UILabel class]]) {
-        CGRect tf = titleLabel.frame;
-        favBtn.frame = CGRectMake(panel.bounds.size.width - tw - 10.0,
-                                  tf.origin.y + (tf.size.height - th) / 2.0, tw, th);
-    } else {
-        favBtn.frame = CGRectMake(panel.bounds.size.width - tw - 10.0, 8.0, tw, th);
+        // 把插入点及其右侧的按钮整体右移一格，腾出位置
+        for (UIButton *b in btns) {
+            if (b.frame.origin.x >= insertX - 1.0) {
+                CGRect f = b.frame;
+                f.origin.x += step;
+                b.frame = f;
+            }
+        }
+
+        // 优先安全复用找鸡的工厂方法；不可用则自建（风格接近）
+        UIButton *rvBtn = ZZTryMakeFilterButton_Safe(
+            self, insertX, y, w, @selector(zzOpenRegionVersion:));
+        if (!rvBtn) {
+            rvBtn = ZZMakePlainButton(CGRectMake(insertX, y, w, h > 0 ? h : 32.0),
+                                      ZZRegionVersionTitle(), self,
+                                      @selector(zzOpenRegionVersion:));
+            ZMLOG(@"使用自建按钮（未复用找鸡工厂方法）");
+        }
+        [rvBtn setTitle:ZZRegionVersionTitle() forState:UIControlStateNormal];
+
+        [panel addSubview:rvBtn];
+        objc_setAssociatedObject(self, ZZKey("zzRVButton"), rvBtn,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ZMLOG(@"「版本地区」按钮插入完成 x=%.1f y=%.1f w=%.1f step=%.1f",
+              insertX, y, w, step);
+
+        // ---- 「我的收藏」入口：面板右上角 ----
+        UILabel *titleLabel = ZZSafeGet(self, @"titleLabel");
+        UIButton *favBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        [favBtn setTitle:@"我的收藏" forState:UIControlStateNormal];
+        favBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        [favBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        CGFloat tw = 76.0, th = 30.0;
+        if ([titleLabel isKindOfClass:[UILabel class]]) {
+            CGRect tf = titleLabel.frame;
+            favBtn.frame = CGRectMake(panel.bounds.size.width - tw - 10.0,
+                                      tf.origin.y + (tf.size.height - th) / 2.0, tw, th);
+        } else {
+            favBtn.frame = CGRectMake(panel.bounds.size.width - tw - 10.0, 8.0, tw, th);
+        }
+        [favBtn addTarget:self
+                   action:@selector(zzOpenFavorites:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [panel addSubview:favBtn];
+        objc_setAssociatedObject(self, ZZKey("zzFavEntry"), favBtn,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ZMLOG(@"「我的收藏」入口插入完成 %@", NSStringFromCGRect(favBtn.frame));
+    } @catch (NSException *e) {
+        ZMLOG(@"buildPanel 注入过程抛异常，已忽略: %@", e.reason);
     }
-    [favBtn addTarget:self
-               action:@selector(zzOpenFavorites:)
-     forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:favBtn];
-    objc_setAssociatedObject(self, ZZKey("zzFavEntry"), favBtn,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    ZMLOG(@"「我的收藏」入口插入完成 %@", NSStringFromCGRect(favBtn.frame));
 }
 
 - (void)zzOpenRegionVersion:(id)sender {
@@ -786,17 +839,26 @@ static NSArray<NSDictionary *> *ZZFilteredSnapshots(id zzfloat) {
 // ---- 筛选变化后刷新 ----
 - (void)refilter {
     %orig;
-    UITableView *tv = ZZSafeGet(self, @"table");
-    if ([tv isKindOfClass:[UITableView class]] && tv.dataSource == self) {
-        [tv reloadData];
+    @try {
+        UITableView *tv = ZZSafeGet(self, @"table");
+        if ([tv isKindOfClass:[UITableView class]] && tv.dataSource == self) {
+            [tv reloadData];
+        }
+    } @catch (NSException *e) {
+        ZMLOG(@"refilter 附加逻辑抛异常，已忽略: %@", e.reason);
     }
 }
 
 // ---- 行数：叠加「版本地区」这一层过滤 ----
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
-    if ([tv isKindOfClass:[UITableView class]] && tv.dataSource == self) {
-        NSArray<NSDictionary *> *pass = ZZFilteredSnapshots(self);
-        if (pass) return (NSInteger)pass.count;
+    // 注意：超出预期的情况一律退回 %orig，保证与找鸡自身行为一致
+    @try {
+        if ([tv isKindOfClass:[UITableView class]] && tv.dataSource == self) {
+            NSArray<NSDictionary *> *pass = ZZFilteredSnapshots(self);
+            if (pass) return (NSInteger)pass.count;
+        }
+    } @catch (NSException *e) {
+        ZMLOG(@"numberOfRowsInSection 附加逻辑抛异常，退回原实现: %@", e.reason);
     }
     return %orig;
 }
@@ -806,34 +868,42 @@ static NSArray<NSDictionary *> *ZZFilteredSnapshots(id zzfloat) {
     UITableViewCell *cell = %orig;
     if (!cell) return cell;
 
-    NSDictionary *snap = nil;
-    NSArray<NSDictionary *> *pass = ZZFilteredSnapshots(self);
-    if (pass) {
-        if (ip.row < (NSInteger)pass.count) snap = pass[(NSUInteger)ip.row];
-    } else {
-        NSArray *shown = ZZSafeGet(self, @"shown");
-        if ([shown isKindOfClass:[NSArray class]] && ip.row < (NSInteger)shown.count) {
-            snap = ZZItemSnapshot(shown[(NSUInteger)ip.row]);
+    @try {
+        NSDictionary *snap = nil;
+        NSArray<NSDictionary *> *pass = ZZFilteredSnapshots(self);
+        if (pass) {
+            if (ip.row < (NSInteger)pass.count) snap = pass[(NSUInteger)ip.row];
+        } else {
+            NSArray *shown = ZZSafeGet(self, @"shown");
+            if ([shown isKindOfClass:[NSArray class]] && ip.row < (NSInteger)shown.count) {
+                snap = ZZItemSnapshot(shown[(NSUInteger)ip.row]);
+            }
         }
-    }
-    if (!snap) return cell;
+        if (!snap) return cell;
 
-    objc_setAssociatedObject(cell, ZZKey("zzFavSnapshot"), snap,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    ZZInstallFavoriteButton(cell, snap);
+        objc_setAssociatedObject(cell, ZZKey("zzFavSnapshot"), snap,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ZZInstallFavoriteButton(cell, snap);
+    } @catch (NSException *e) {
+        ZMLOG(@"cellForRowAtIndexPath 附加逻辑抛异常，返回原 cell: %@", e.reason);
+    }
     return cell;
 }
 
 // ---- 收藏按钮点击 ----
 - (void)zzFavoriteTapped:(UIButton *)sender {
-    // 从 sender 所在 cell 取快照
-    UIView *v = sender;
-    while (v && ![v isKindOfClass:[UITableViewCell class]]) v = v.superview;
-    NSDictionary *snap = ZZSnapshotForCell((UITableViewCell *)v);
-    if (!snap) { ZZToast(sender, @"没取到商品信息"); return; }
-    BOOL now = [[ZZFavStore shared] toggle:snap];
-    [sender setTitle:now ? @"★ 已收藏" : @"☆ 收藏" forState:UIControlStateNormal];
-    ZZToast(sender, now ? @"已加入收藏" : @"已取消收藏");
+    @try {
+        // 从 sender 所在 cell 取快照
+        UIView *v = sender;
+        while (v && ![v isKindOfClass:[UITableViewCell class]]) v = v.superview;
+        NSDictionary *snap = ZZSnapshotForCell((UITableViewCell *)v);
+        if (!snap) { ZZToast(sender, @"没取到商品信息"); return; }
+        BOOL now = [[ZZFavStore shared] toggle:snap];
+        [sender setTitle:now ? @"★ 已收藏" : @"☆ 收藏" forState:UIControlStateNormal];
+        ZZToast(sender, now ? @"已加入收藏" : @"已取消收藏");
+    } @catch (NSException *e) {
+        ZMLOG(@"zzFavoriteTapped 抛异常，已忽略: %@", e.reason);
+    }
 }
 
 %end
